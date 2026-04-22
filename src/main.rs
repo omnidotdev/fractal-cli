@@ -1,5 +1,7 @@
+mod destroy;
 mod env;
 mod restart;
+mod restore;
 mod rollback;
 mod scale;
 
@@ -32,6 +34,16 @@ enum Commands {
     },
     /// Roll back a service to its previous version
     Rollback {
+        /// Service name
+        service: String,
+    },
+    /// Delete a service (enters grace period before permanent deletion)
+    Destroy {
+        /// Service name
+        service: String,
+    },
+    /// Restore a service from pending deletion
+    Restore {
         /// Service name
         service: String,
     },
@@ -95,6 +107,8 @@ fn main() -> ExitCode {
         }
         Commands::Restart { service } => rt.block_on(restart::restart_service(&service)),
         Commands::Rollback { service } => rt.block_on(rollback::rollback_service(&service)),
+        Commands::Destroy { service } => rt.block_on(destroy::destroy_service(&service)),
+        Commands::Restore { service } => rt.block_on(restore::restore_service(&service)),
         Commands::Env { action } => match action {
             EnvCommands::List { service } => rt.block_on(env::list_env(&service)),
             EnvCommands::Set { service, pair } => rt.block_on(env::set_env(&service, &pair)),
