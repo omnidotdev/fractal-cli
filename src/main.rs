@@ -1,5 +1,7 @@
 mod destroy;
 mod env;
+mod exec;
+mod logs;
 mod restart;
 mod restore;
 mod rollback;
@@ -51,6 +53,34 @@ enum Commands {
     Env {
         #[command(subcommand)]
         action: EnvCommands,
+    },
+    /// Tail logs from a service's pods
+    Logs {
+        /// Service name
+        service: String,
+        /// Follow the log stream (tail -f)
+        #[arg(short, long)]
+        follow: bool,
+        /// Show logs since duration ago (e.g. 5m, 1h, 2d)
+        #[arg(long)]
+        since: Option<String>,
+        /// Show only the last N lines per pod
+        #[arg(short, long)]
+        tail: Option<i64>,
+        /// Filter lines containing this substring
+        #[arg(short, long)]
+        grep: Option<String>,
+    },
+    /// Exec a command in a service's running pod
+    Exec {
+        /// Service name
+        service: String,
+        /// Allocate a TTY (interactive shells need this)
+        #[arg(short = 't', long)]
+        tty: bool,
+        /// Command to run (defaults to /bin/sh)
+        #[arg(trailing_var_arg = true)]
+        cmd: Vec<String>,
     },
 }
 
@@ -120,6 +150,20 @@ fn main() -> ExitCode {
             } => rt.block_on(env::set_secret_env(&service, &name, &secret, &key)),
             EnvCommands::Unset { service, name } => rt.block_on(env::unset_env(&service, &name)),
         },
+        Commands::Logs {
+            service,
+            follow,
+            since,
+            tail,
+            grep,
+        } => rt.block_on(logs::tail_logs(
+            &service,
+            follow,
+            since.as_deref(),
+            tail,
+            grep.as_deref(),
+        )),
+        Commands::Exec { service, tty, cmd } => rt.block_on(exec::exec_in_service(&service, &cmd, tty)),
     };
 
     match result {
