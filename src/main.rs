@@ -8,6 +8,7 @@ mod restart;
 mod restore;
 mod rollback;
 mod scale;
+mod secrets_sync;
 
 use std::process::ExitCode;
 
@@ -98,6 +99,17 @@ enum Commands {
         /// Print connection info instead of execing psql
         #[arg(long)]
         print_only: bool,
+    },
+    /// Sync a service's env vars into a local .env file
+    SecretsSync {
+        /// Service name
+        service: String,
+        /// Output path (defaults to ./.env)
+        #[arg(short, long, default_value = ".env")]
+        output: std::path::PathBuf,
+        /// Overwrite existing values in the output file
+        #[arg(long)]
+        overwrite: bool,
     },
 }
 
@@ -203,6 +215,11 @@ fn main() -> ExitCode {
         Commands::DbConnect { service, print_only } => {
             rt.block_on(db_connect::db_connect(&service, print_only))
         }
+        Commands::SecretsSync {
+            service,
+            output,
+            overwrite,
+        } => rt.block_on(secrets_sync::sync_secrets(&service, &output, overwrite)),
     };
 
     match result {
