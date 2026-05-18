@@ -3,6 +3,7 @@ mod destroy;
 mod env;
 mod exec;
 mod logs;
+mod members;
 mod port_forward;
 mod restart;
 mod restore;
@@ -110,6 +111,37 @@ enum Commands {
         /// Overwrite existing values in the output file
         #[arg(long)]
         overwrite: bool,
+    },
+    /// Manage per-project members (admin / developer / viewer)
+    Members {
+        #[command(subcommand)]
+        action: MembersCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum MembersCommands {
+    /// List members of a project
+    List {
+        /// Project name
+        project: String,
+    },
+    /// Add or update a member's role on a project
+    Add {
+        /// Project name
+        project: String,
+        /// User ID or email
+        user: String,
+        /// Role (admin / developer / viewer)
+        #[arg(short, long, default_value = "developer")]
+        role: String,
+    },
+    /// Remove a member from a project (owner cannot be removed)
+    Remove {
+        /// Project name
+        project: String,
+        /// User ID or email
+        user: String,
     },
 }
 
@@ -220,6 +252,17 @@ fn main() -> ExitCode {
             output,
             overwrite,
         } => rt.block_on(secrets_sync::sync_secrets(&service, &output, overwrite)),
+        Commands::Members { action } => match action {
+            MembersCommands::List { project } => rt.block_on(members::list_members(&project)),
+            MembersCommands::Add {
+                project,
+                user,
+                role,
+            } => rt.block_on(members::add_member(&project, &user, &role)),
+            MembersCommands::Remove { project, user } => {
+                rt.block_on(members::remove_member(&project, &user))
+            }
+        },
     };
 
     match result {
