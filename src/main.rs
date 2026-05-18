@@ -1,3 +1,4 @@
+mod cluster;
 mod db_connect;
 mod destroy;
 mod env;
@@ -10,6 +11,7 @@ mod restore;
 mod rollback;
 mod scale;
 mod secrets_sync;
+mod tokens;
 
 use std::process::ExitCode;
 
@@ -117,6 +119,66 @@ enum Commands {
         #[command(subcommand)]
         action: MembersCommands,
     },
+    /// Connect, inspect, or disconnect a Kubernetes cluster for BYOC
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterCommands,
+    },
+    /// Manage service-account API tokens (CI deploys, automation)
+    Tokens {
+        #[command(subcommand)]
+        action: TokensCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokensCommands {
+    /// List tokens in the current workspace
+    List,
+    /// Mint a new token. The plaintext is printed once; only its hash is stored.
+    Create {
+        /// Human-readable label (e.g. "github-actions-ci")
+        #[arg(long)]
+        name: String,
+        /// HIDRA user id / email the token acts as. Use "service-account"
+        /// for tokens not bound to a real user.
+        #[arg(long, default_value = "service-account")]
+        subject: String,
+        /// Project slugs the token can act on. Pass `--scope *` for
+        /// workspace-wide access. Can be specified multiple times.
+        #[arg(long = "scope", value_name = "PROJECT")]
+        scopes: Vec<String>,
+        /// Token lifetime in days. Omit for never-expires.
+        #[arg(long)]
+        expires_in_days: Option<i64>,
+    },
+    /// Revoke a token (sets spec.revokedAt; CR remains for audit)
+    Revoke {
+        /// Token label
+        name: String,
+    },
+    /// Permanently delete a token CR (audit trail goes with it; prefer revoke)
+    Delete {
+        /// Token label
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClusterCommands {
+    /// Validate connectivity and print install instructions for a cluster
+    Connect {
+        /// Kubeconfig path (defaults to $KUBECONFIG or ~/.kube/config)
+        #[arg(long)]
+        kubeconfig: Option<std::path::PathBuf>,
+        /// Kubeconfig context to use (defaults to the current context)
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// Report whether the fractal-operator is installed and Ready
+    Status,
+    /// Revoke this cluster's dashboard registration (placeholder)
+    Disconnect,
 }
 
 #[derive(Subcommand)]
@@ -262,6 +324,25 @@ fn main() -> ExitCode {
             MembersCommands::Remove { project, user } => {
                 rt.block_on(members::remove_member(&project, &user))
             }
+        },
+        Commands::Cluster { action } => match action {
+            ClusterCommands::Connect {
+                kubeconfig,
+                context,
+            } => rt.block_on(cluster::connect(kubeconfig, context)),
+            ClusterCommands::Status => rt.block_on(cluster::status()),
+            ClusterCommands::Disconnect => rt.block_on(cluster::disconnect()),
+        },
+        Commands::Tokens { action } => match action {
+            TokensCommands::List => rt.block_on(tokens::list_tokens()),
+            TokensCommands::Create {
+                name,
+                subject,
+                scopes,
+                expires_in_days,
+            } => rt.block_on(tokens::create_token(&name, &subject, scopes, expires_in_days)),
+            TokensCommands::Revoke { name } => rt.block_on(tokens::revoke_token(&name)),
+            TokensCommands::Delete { name } => rt.block_on(tokens::delete_token(&name)),
         },
     };
 

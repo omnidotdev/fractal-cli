@@ -133,6 +133,7 @@ pub async fn set_secret_env(
                 name: secret.to_string(),
                 key: key.to_string(),
             }),
+            ..Default::default()
         }),
     };
 
