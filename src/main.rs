@@ -1,7 +1,9 @@
+mod db_connect;
 mod destroy;
 mod env;
 mod exec;
 mod logs;
+mod port_forward;
 mod restart;
 mod restore;
 mod rollback;
@@ -82,6 +84,36 @@ enum Commands {
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
     },
+    /// Forward a local port to a service's pod
+    PortForward {
+        /// Service name
+        service: String,
+        /// "local:remote" or just "port" for same on both
+        ports: String,
+    },
+    /// Connect to a Database service via psql
+    DbConnect {
+        /// Service name (must be a Database service)
+        service: String,
+        /// Print connection info instead of execing psql
+        #[arg(long)]
+        print_only: bool,
+    },
+}
+
+fn parse_ports(s: &str) -> anyhow::Result<(u16, u16)> {
+    let parsed: Vec<u16> = s
+        .split(':')
+        .map(|p| {
+            p.parse::<u16>()
+                .map_err(|e| anyhow::anyhow!("invalid port '{p}': {e}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    match parsed.as_slice() {
+        [single] => Ok((*single, *single)),
+        [local, remote] => Ok((*local, *remote)),
+        _ => anyhow::bail!("ports must be 'PORT' or 'LOCAL:REMOTE'"),
+    }
 }
 
 #[derive(Subcommand)]
@@ -164,6 +196,13 @@ fn main() -> ExitCode {
             grep.as_deref(),
         )),
         Commands::Exec { service, tty, cmd } => rt.block_on(exec::exec_in_service(&service, &cmd, tty)),
+        Commands::PortForward { service, ports } => match parse_ports(&ports) {
+            Ok((local, remote)) => rt.block_on(port_forward::port_forward(&service, local, remote)),
+            Err(e) => Err(e),
+        },
+        Commands::DbConnect { service, print_only } => {
+            rt.block_on(db_connect::db_connect(&service, print_only))
+        }
     };
 
     match result {
