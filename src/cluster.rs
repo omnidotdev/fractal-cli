@@ -57,6 +57,39 @@ struct MintTokenResponse {
     instructions: String,
 }
 
+/// Shape of one row in the list endpoint response. Mirrors the
+/// `presentToken` function in `fractal-api/src/routes/clusters.ts`.
+#[derive(serde::Deserialize)]
+struct ListedInstallToken {
+    id: String,
+    #[serde(rename = "clusterName")]
+    cluster_name: Option<String>,
+    status: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    #[serde(rename = "expiresAt")]
+    expires_at: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ListedInstallTokensResponse {
+    tokens: Vec<ListedInstallToken>,
+}
+
+/// Shared helper: build a reqwest client + resolve API URL + token.
+fn api_session() -> Result<(String, String, reqwest::Client)> {
+    let base = api_url().context(
+        "FRACTAL_API_URL not set (point at https://api.fractal.omni.dev or your dev API)",
+    )?;
+    let token = auth_token().context(
+        "Not authenticated. Run `fractal auth login` (or set FRACTAL_AUTH_TOKEN).",
+    )?;
+    let client = reqwest::Client::builder()
+        .build()
+        .context("failed to build HTTP client")?;
+    Ok((base, token, client))
+}
+
 /// Mint a per-cluster install token from the Fractal API.
 ///
 /// # Errors
@@ -66,17 +99,8 @@ struct MintTokenResponse {
 async fn mint_install_token(
     cluster_name: Option<&str>,
 ) -> Result<MintTokenResponse> {
-    let base = api_url().context(
-        "FRACTAL_API_URL not set (point at https://api.fractal.omni.dev or your dev API)",
-    )?;
-    let token = auth_token().context(
-        "FRACTAL_AUTH_TOKEN not set (paste a Gatekeeper bearer from the dashboard)",
-    )?;
-
+    let (base, token, client) = api_session()?;
     let url = format!("{}/v1/clusters/install-tokens", base.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .build()
-        .context("failed to build HTTP client")?;
     let resp = client
         .post(&url)
         .bearer_auth(&token)
@@ -97,6 +121,123 @@ async fn mint_install_token(
     resp.json::<MintTokenResponse>()
         .await
         .context("install token response could not be parsed")
+}
+
+/// List the caller's install tokens. Prints a table with status,
+/// cluster label, and expiry. Output matches the dashboard's Clusters
+/// page shape.
+///
+/// # Errors
+///
+/// Returns an error if env vars are missing, the HTTP call fails, or
+/// the server returns a non-2xx status.
+pub async fn list_tokens() -> Result<()> {
+    let (base, token, client) = api_session()?;
+    let url = format!("{}/v1/clusters/install-tokens", base.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .with_context(|| format!("GET {url} failed"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "list endpoint returned {status}: {}",
+            if body.is_empty() { "<empty body>" } else { &body }
+        );
+    }
+
+    let parsed: ListedInstallTokensResponse = resp
+        .json()
+        .await
+        .context("list response could not be parsed")?;
+
+    if parsed.tokens.is_empty() {
+        println!("{}", "(no install tokens issued)".dimmed());
+        return Ok(());
+    }
+
+    println!(
+        "{:<24}  {:<10}  {:<24}  {}",
+        "CLUSTER".bold(),
+        "STATUS".bold(),
+        "CREATED".bold(),
+        "EXPIRES".bold(),
+    );
+    for tok in parsed.tokens {
+        let cluster = tok.cluster_name.as_deref().unwrap_or("(unnamed)");
+        let status = match tok.status.as_str() {
+            "active" => tok.status.green().to_string(),
+            "used" => tok.status.dimmed().to_string(),
+            _ => tok.status.yellow().to_string(),
+        };
+        println!(
+            "{:<24}  {:<10}  {:<24}  {}\n  {}: {}",
+            cluster.cyan(),
+            status,
+            tok.created_at.dimmed(),
+            tok.expires_at.dimmed(),
+            "id".dimmed(),
+            tok.id.dimmed(),
+        );
+    }
+    Ok(())
+}
+
+/// Revoke a previously-minted install token by id. fractal-api scopes
+/// the delete to the caller's tokens; a 404 means the id wasn't yours
+/// or never existed.
+///
+/// # Errors
+///
+/// Returns an error if env vars are missing, the HTTP call fails, or
+/// the server returns a non-2xx status.
+pub async fn revoke_token(id: &str) -> Result<()> {
+    let (base, token, client) = api_session()?;
+    let url = format!(
+        "{}/v1/clusters/install-tokens/{}",
+        base.trim_end_matches('/'),
+        urlencode_path_segment(id),
+    );
+    let resp = client
+        .delete(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url} failed"))?;
+
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        anyhow::bail!("token {id} not found (it may belong to another user, or never existed)");
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "revoke endpoint returned {status}: {}",
+            if body.is_empty() { "<empty body>" } else { &body }
+        );
+    }
+    println!("{} token {} revoked", "\u{2713}".green(), id.cyan());
+    Ok(())
+}
+
+/// Minimal URL-path-segment escape. The install-token id is a UUID
+/// per the DB column default, but defending against arbitrary input is
+/// cheap and avoids surprises if the id format ever changes.
+fn urlencode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Resolve the kubeconfig path to use.
