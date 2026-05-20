@@ -203,6 +203,13 @@ enum ClusterCommands {
     Status,
     /// Revoke this cluster's dashboard registration (placeholder)
     Disconnect,
+    /// List install tokens you have issued (active, used, expired)
+    ListTokens,
+    /// Revoke an install token by id (from `cluster list-tokens`)
+    RevokeToken {
+        /// Token id to revoke
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -357,6 +364,10 @@ fn main() -> ExitCode {
             } => rt.block_on(cluster::connect(kubeconfig, context, name)),
             ClusterCommands::Status => rt.block_on(cluster::status()),
             ClusterCommands::Disconnect => rt.block_on(cluster::disconnect()),
+            ClusterCommands::ListTokens => rt.block_on(cluster::list_tokens()),
+            ClusterCommands::RevokeToken { id } => {
+                rt.block_on(cluster::revoke_token(&id))
+            }
         },
         Commands::Tokens { action } => match action {
             TokensCommands::List => rt.block_on(tokens::list_tokens()),
