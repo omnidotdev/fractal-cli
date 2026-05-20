@@ -24,6 +24,11 @@ futures = "0.3"
 k8s-openapi = { version = "0.27", default-features = false, features = ["latest"] }
 kube = { version = "3", features = ["runtime", "derive", "ws"] }
 rand = "0.9"
+# rustls-tls-native-roots picks up the system trust store via rustls.
+# Keep aws-lc-rs OUT of the dep tree: `default-features = false` drops
+# reqwest's default-tls (which pulls aws-lc-sys via hyper-rustls and
+# bites us with rustc ICEs at build time, see operator's same pattern.)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

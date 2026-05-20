@@ -174,6 +174,12 @@ enum ClusterCommands {
         /// Kubeconfig context to use (defaults to the current context)
         #[arg(long)]
         context: Option<String>,
+        /// Human-readable label for the cluster (e.g. "us-east-prod").
+        /// Used only when `FRACTAL_API_URL` + `FRACTAL_AUTH_TOKEN` are
+        /// set so the CLI can mint a per-cluster install token via the
+        /// API.
+        #[arg(long = "name")]
+        name: Option<String>,
     },
     /// Report whether the fractal-operator is installed and Ready
     Status,
@@ -329,7 +335,8 @@ fn main() -> ExitCode {
             ClusterCommands::Connect {
                 kubeconfig,
                 context,
-            } => rt.block_on(cluster::connect(kubeconfig, context)),
+                name,
+            } => rt.block_on(cluster::connect(kubeconfig, context, name)),
             ClusterCommands::Status => rt.block_on(cluster::status()),
             ClusterCommands::Disconnect => rt.block_on(cluster::disconnect()),
         },
