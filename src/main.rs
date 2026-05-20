@@ -1,4 +1,6 @@
+mod auth;
 mod cluster;
+mod config;
 mod db_connect;
 mod destroy;
 mod env;
@@ -129,6 +131,22 @@ enum Commands {
         #[command(subcommand)]
         action: TokensCommands,
     },
+    /// Authenticate with the Fractal control plane
+    Auth {
+        #[command(subcommand)]
+        action: AuthCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Log in with email + password, persisting a bearer token at
+    /// ~/.config/fractal/config.toml
+    Login,
+    /// Clear the persisted bearer token
+    Logout,
+    /// Print the currently logged-in identity
+    Whoami,
 }
 
 #[derive(Subcommand)]
@@ -350,6 +368,11 @@ fn main() -> ExitCode {
             } => rt.block_on(tokens::create_token(&name, &subject, scopes, expires_in_days)),
             TokensCommands::Revoke { name } => rt.block_on(tokens::revoke_token(&name)),
             TokensCommands::Delete { name } => rt.block_on(tokens::delete_token(&name)),
+        },
+        Commands::Auth { action } => match action {
+            AuthCommands::Login => rt.block_on(auth::login()),
+            AuthCommands::Logout => auth::logout(),
+            AuthCommands::Whoami => auth::whoami(),
         },
     };
 

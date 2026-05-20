@@ -23,10 +23,19 @@ fn api_url() -> Option<String> {
 }
 
 /// Gatekeeper-issued bearer token used to authenticate the mint call.
-/// v1 expects the user to paste a token from the dashboard / browser
-/// session; a proper `fractal auth login` flow is a separate task.
+/// Lookup order:
+///   1. `FRACTAL_AUTH_TOKEN` env var (CI/automation override).
+///   2. `~/.config/fractal/config.toml` populated by
+///      `fractal auth login`.
 fn auth_token() -> Option<String> {
-    std::env::var("FRACTAL_AUTH_TOKEN").ok()
+    if let Ok(env) = std::env::var("FRACTAL_AUTH_TOKEN") {
+        if !env.is_empty() {
+            return Some(env);
+        }
+    }
+    crate::config::Config::load()
+        .ok()
+        .and_then(|c| c.auth.access_token)
 }
 
 /// Shape of `POST /v1/clusters/install-tokens` request body. Currently
