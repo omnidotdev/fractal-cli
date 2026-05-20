@@ -2,6 +2,7 @@ mod auth;
 mod cluster;
 mod config;
 mod db_connect;
+mod deploy;
 mod destroy;
 mod env;
 mod exec;
@@ -135,6 +136,26 @@ enum Commands {
     Auth {
         #[command(subcommand)]
         action: AuthCommands,
+    },
+    /// Trigger a rebuild on a FractalService via fractal-api (CI use).
+    ///
+    /// Unlike `restart`, this goes through the authed HTTP endpoint
+    /// (Gatekeeper JWT + project-developer role) instead of patching
+    /// the K8s Deployment directly, so it works from CI runners that
+    /// don't have cluster RBAC.
+    Deploy {
+        /// Namespace the FractalService lives in (e.g. fractal-myproject)
+        #[arg(long)]
+        namespace: String,
+        /// Parent FractalProject name (used for RBAC)
+        #[arg(long)]
+        project: String,
+        /// FractalService name to rebuild
+        #[arg(long)]
+        service: String,
+        /// Optional environment to target (e.g. "production")
+        #[arg(long)]
+        env: Option<String>,
     },
 }
 
@@ -385,6 +406,12 @@ fn main() -> ExitCode {
             AuthCommands::Logout => auth::logout(),
             AuthCommands::Whoami => auth::whoami(),
         },
+        Commands::Deploy {
+            namespace,
+            project,
+            service,
+            env,
+        } => rt.block_on(deploy::deploy(&namespace, &project, &service, env)),
     };
 
     match result {

@@ -77,7 +77,9 @@ struct ListedInstallTokensResponse {
 }
 
 /// Shared helper: build a reqwest client + resolve API URL + token.
-fn api_session() -> Result<(String, String, reqwest::Client)> {
+/// `pub(crate)` so sibling commands (deploy, etc) can reuse the same
+/// auth resolution.
+pub(crate) fn api_session() -> Result<(String, String, reqwest::Client)> {
     let base = api_url().context(
         "FRACTAL_API_URL not set (point at https://api.fractal.omni.dev or your dev API)",
     )?;
