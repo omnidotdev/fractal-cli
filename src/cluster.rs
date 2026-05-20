@@ -7,21 +7,87 @@ use kube::api::ListParams;
 use kube::config::{Kubeconfig, KubeConfigOptions};
 use kube::{Api, Client, Config};
 
-/// Default install bundle URL printed by `fractal cluster connect`.
-///
-/// Will be replaced by a per-cluster signed URL once the install bundle
-/// generator endpoint (Phase C step 2) is wired into the Fractal `SaaS`
-/// plane. For now this points at the static published bundle so the CLI
-/// can be exercised end-to-end against the `GitOps`-checked manifests.
+/// Fallback install bundle URL printed when the per-cluster mint
+/// endpoint isn't reachable (e.g. the user hasn't set `FRACTAL_API_URL`
+/// or `FRACTAL_AUTH_TOKEN`). Lets the CLI still produce a runnable
+/// install command for users on the OSS path.
 const DEFAULT_BUNDLE_URL: &str =
     "https://fractal.omni.dev/install/operator.yaml";
 
-/// Endpoint that issues per-cluster install tokens + signed bundle URLs.
-/// Currently `None` (the `SaaS` endpoint isn't deployed yet). When set,
-/// the connect command exchanges the user's session for a cluster-scoped
-/// install token and signed bundle URL.
-fn install_endpoint() -> Option<String> {
-    std::env::var("FRACTAL_INSTALL_ENDPOINT").ok()
+/// Public base URL of the Fractal API. Used to mint per-cluster install
+/// tokens against `POST /v1/clusters/install-tokens`. Required - the CLI
+/// has no embedded default because production and dev hit different
+/// hosts.
+fn api_url() -> Option<String> {
+    std::env::var("FRACTAL_API_URL").ok()
+}
+
+/// Gatekeeper-issued bearer token used to authenticate the mint call.
+/// v1 expects the user to paste a token from the dashboard / browser
+/// session; a proper `fractal auth login` flow is a separate task.
+fn auth_token() -> Option<String> {
+    std::env::var("FRACTAL_AUTH_TOKEN").ok()
+}
+
+/// Shape of `POST /v1/clusters/install-tokens` request body. Currently
+/// just the optional human-readable cluster label.
+#[derive(serde::Serialize)]
+struct MintTokenRequest<'a> {
+    #[serde(rename = "clusterName", skip_serializing_if = "Option::is_none")]
+    cluster_name: Option<&'a str>,
+}
+
+/// Shape of the successful mint response. Matches
+/// `src/routes/clusters.ts` on the server side.
+#[derive(serde::Deserialize)]
+struct MintTokenResponse {
+    #[serde(rename = "installUrl")]
+    install_url: String,
+    #[serde(rename = "expiresAt")]
+    expires_at: String,
+    instructions: String,
+}
+
+/// Mint a per-cluster install token from the Fractal API.
+///
+/// # Errors
+///
+/// Returns an error if the API URL or auth token env vars are missing,
+/// the HTTP call fails, or the server returns a non-2xx status.
+async fn mint_install_token(
+    cluster_name: Option<&str>,
+) -> Result<MintTokenResponse> {
+    let base = api_url().context(
+        "FRACTAL_API_URL not set (point at https://api.fractal.omni.dev or your dev API)",
+    )?;
+    let token = auth_token().context(
+        "FRACTAL_AUTH_TOKEN not set (paste a Gatekeeper bearer from the dashboard)",
+    )?;
+
+    let url = format!("{}/v1/clusters/install-tokens", base.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .build()
+        .context("failed to build HTTP client")?;
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&MintTokenRequest { cluster_name })
+        .send()
+        .await
+        .with_context(|| format!("POST {url} failed"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "mint endpoint returned {status}: {}",
+            if body.is_empty() { "<empty body>" } else { &body }
+        );
+    }
+
+    resp.json::<MintTokenResponse>()
+        .await
+        .context("install token response could not be parsed")
 }
 
 /// Resolve the kubeconfig path to use.
@@ -59,15 +125,67 @@ fn resolve_kubeconfig_path_inner(
     Ok(PathBuf::from(home).join(".kube/config"))
 }
 
+/// Mint an install token and print its URL + instructions. Returns
+/// `true` if mint succeeded (caller should skip the static fallback);
+/// `false` if mint failed (caller should print the static fallback).
+/// Errors are logged inline as warnings - this is a soft-fail because
+/// the OSS bundle is still a usable install path.
+async fn try_mint_and_print(cluster_name: Option<&str>) -> bool {
+    match mint_install_token(cluster_name).await {
+        Ok(minted) => {
+            println!(
+                "{} {}):",
+                "Install URL (single-use, expires".bold(),
+                minted.expires_at.bold()
+            );
+            println!("  {}", minted.install_url.cyan());
+            println!();
+            println!("{}", "To install, run:".bold());
+            for line in minted.instructions.lines() {
+                println!("  {}", line.dimmed());
+            }
+            println!();
+            println!(
+                "{} once the operator pod is Ready, run {} to verify.",
+                "Then:".bold(),
+                "fractal cluster status".cyan()
+            );
+            true
+        }
+        Err(err) => {
+            println!(
+                "{} could not mint install token: {err}",
+                "Warning:".yellow().bold(),
+            );
+            println!(
+                "{} falling back to static OSS bundle URL",
+                "Note:".yellow().bold(),
+            );
+            println!();
+            false
+        }
+    }
+}
+
 /// Validate cluster connectivity, then print install instructions.
+///
+/// When `FRACTAL_API_URL` + `FRACTAL_AUTH_TOKEN` are set, mints a
+/// single-use install token via the API and prints the signed URL +
+/// curl-into-kubectl command. Otherwise falls back to the static OSS
+/// bundle URL.
 ///
 /// # Errors
 ///
 /// Returns an error if the kubeconfig cannot be loaded or the apiserver
 /// is unreachable. Cluster introspection failures (node list, version)
 /// are surfaced as warnings rather than hard errors so the user still
-/// gets the install URL.
-pub async fn connect(kubeconfig: Option<PathBuf>, context: Option<String>) -> Result<()> {
+/// gets the install URL. Mint failures are also surfaced as warnings;
+/// the fallback bundle URL still works for OSS installs.
+pub async fn connect(
+    kubeconfig: Option<PathBuf>,
+    context: Option<String>,
+    cluster_name: Option<String>,
+) -> Result<()> {
     let path = resolve_kubeconfig_path(kubeconfig.as_deref())?;
     if !path.exists() {
         anyhow::bail!(
@@ -132,26 +250,18 @@ pub async fn connect(kubeconfig: Option<PathBuf>, context: Option<String>) -> Re
 
     println!();
 
-    match install_endpoint() {
-        Some(endpoint) => {
-            println!(
-                "{} TODO: exchange session for signed install bundle via {}",
-                "Install:".bold(),
-                endpoint.dimmed(),
-            );
-            println!(
-                "{} bundle URL endpoint not yet implemented (Phase C step 2)",
-                "Note:".yellow().bold(),
-            );
-        }
-        None => {
-            println!(
-                "{} {}",
-                "Install bundle (static, unsigned):".bold(),
-                DEFAULT_BUNDLE_URL.cyan()
-            );
-        }
+    if api_url().is_some()
+        && auth_token().is_some()
+        && try_mint_and_print(cluster_name.as_deref()).await
+    {
+        return Ok(());
     }
+
+    println!(
+        "{} {}",
+        "Install bundle (static, unsigned):".bold(),
+        DEFAULT_BUNDLE_URL.cyan()
+    );
 
     println!();
     println!("{}", "To install, run:".bold());
