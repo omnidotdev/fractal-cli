@@ -19,7 +19,8 @@ mod tokens;
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 
 /// Fractal - deploy applications to Kubernetes
 #[derive(Parser)]
@@ -143,6 +144,15 @@ enum Commands {
     Canary {
         #[command(subcommand)]
         action: CanaryCommands,
+    },
+    /// Generate shell completion script for the given shell. Pipe to
+    /// the shell's completion directory; e.g.:
+    ///   fractal completions zsh > ~/.zfunc/_fractal
+    ///   fractal completions bash | sudo tee /etc/bash_completion.d/fractal
+    ///   fractal completions fish > ~/.config/fish/completions/fractal.fish
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
     },
     /// Trigger a rebuild on a FractalService via fractal-api (CI use).
     ///
@@ -449,6 +459,12 @@ fn main() -> ExitCode {
             service,
             env,
         } => rt.block_on(deploy::deploy(&namespace, &project, &service, env)),
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let bin_name = cmd.get_name().to_string();
+            generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+            Ok(())
+        }
         Commands::Canary { action } => match action {
             CanaryCommands::Start {
                 service,
