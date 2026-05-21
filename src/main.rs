@@ -15,6 +15,7 @@ mod restore;
 mod rollback;
 mod scale;
 mod secrets_sync;
+mod services;
 mod tokens;
 
 use std::process::ExitCode;
@@ -144,6 +145,12 @@ enum Commands {
     Canary {
         #[command(subcommand)]
         action: CanaryCommands,
+    },
+    /// List all FractalServices in a namespace
+    Services {
+        /// Namespace (defaults to current kubeconfig namespace)
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
     },
     /// Generate shell completion script for the given shell. Pipe to
     /// the shell's completion directory; e.g.:
@@ -459,6 +466,9 @@ fn main() -> ExitCode {
             service,
             env,
         } => rt.block_on(deploy::deploy(&namespace, &project, &service, env)),
+        Commands::Services { namespace } => {
+            rt.block_on(services::list_services(namespace))
+        }
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let bin_name = cmd.get_name().to_string();
