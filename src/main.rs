@@ -1,4 +1,5 @@
 mod auth;
+mod canary;
 mod cluster;
 mod config;
 mod db_connect;
@@ -137,6 +138,12 @@ enum Commands {
         #[command(subcommand)]
         action: AuthCommands,
     },
+    /// Drive a canary rollout on a service: weight a candidate image
+    /// alongside the primary, then promote or abort.
+    Canary {
+        #[command(subcommand)]
+        action: CanaryCommands,
+    },
     /// Trigger a rebuild on a FractalService via fractal-api (CI use).
     ///
     /// Unlike `restart`, this goes through the authed HTTP endpoint
@@ -156,6 +163,36 @@ enum Commands {
         /// Optional environment to target (e.g. "production")
         #[arg(long)]
         env: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CanaryCommands {
+    /// Start a canary on `service` with the given image and weight (0..=100)
+    Start {
+        /// Service name
+        service: String,
+        /// Canary image (e.g. `reg/svc:sha-abc1234`)
+        #[arg(long)]
+        image: String,
+        /// Percentage of traffic to send to the canary
+        #[arg(long, default_value_t = 10)]
+        weight: u8,
+    },
+    /// Promote the active canary: ship its image, retire the primary
+    Promote {
+        /// Service name
+        service: String,
+    },
+    /// Abort the active canary: route 100% back to primary, teardown canary
+    Abort {
+        /// Service name
+        service: String,
+    },
+    /// Show whether a canary is active and its current weight
+    Status {
+        /// Service name
+        service: String,
     },
 }
 
@@ -412,6 +449,22 @@ fn main() -> ExitCode {
             service,
             env,
         } => rt.block_on(deploy::deploy(&namespace, &project, &service, env)),
+        Commands::Canary { action } => match action {
+            CanaryCommands::Start {
+                service,
+                image,
+                weight,
+            } => rt.block_on(canary::start_canary(&service, &image, weight)),
+            CanaryCommands::Promote { service } => {
+                rt.block_on(canary::promote_canary(&service))
+            }
+            CanaryCommands::Abort { service } => {
+                rt.block_on(canary::abort_canary(&service))
+            }
+            CanaryCommands::Status { service } => {
+                rt.block_on(canary::canary_status(&service))
+            }
+        },
     };
 
     match result {
