@@ -10,6 +10,7 @@ mod exec;
 mod logs;
 mod members;
 mod port_forward;
+mod projects;
 mod restart;
 mod restore;
 mod rollback;
@@ -152,6 +153,11 @@ enum Commands {
         #[arg(long, short = 'n')]
         namespace: Option<String>,
     },
+    /// Inspect FractalProject resources
+    Projects {
+        #[command(subcommand)]
+        action: ProjectsCommands,
+    },
     /// Generate shell completion script for the given shell. Pipe to
     /// the shell's completion directory; e.g.:
     ///   fractal completions zsh > ~/.zfunc/_fractal
@@ -180,6 +186,17 @@ enum Commands {
         /// Optional environment to target (e.g. "production")
         #[arg(long)]
         env: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectsCommands {
+    /// List all FractalProject resources
+    List,
+    /// Show a single project's spec + status (namespaces, members, phase)
+    Get {
+        /// Project name (FractalProject metadata.name)
+        name: String,
     },
 }
 
@@ -469,6 +486,12 @@ fn main() -> ExitCode {
         Commands::Services { namespace } => {
             rt.block_on(services::list_services(namespace))
         }
+        Commands::Projects { action } => match action {
+            ProjectsCommands::List => rt.block_on(projects::list_projects()),
+            ProjectsCommands::Get { name } => {
+                rt.block_on(projects::get_project(&name))
+            }
+        },
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let bin_name = cmd.get_name().to_string();
