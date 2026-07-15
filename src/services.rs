@@ -4,8 +4,8 @@
 
 use anyhow::{Context, Result};
 use colored::Colorize;
-use kube::api::{Api, ListParams};
 use kube::Client;
+use kube::api::{Api, ListParams};
 
 use fractal_operator::crd::service::FractalService;
 
@@ -53,23 +53,15 @@ pub async fn list_services(namespace: Option<String>) -> Result<()> {
             .as_ref()
             .map(|s| s.phase.as_str())
             .unwrap_or("Pending");
-        let ready = svc
-            .status
-            .as_ref()
-            .map_or(0, |s| s.ready_replicas);
-        let desired = svc
-            .status
-            .as_ref()
-            .map_or(0, |s| s.desired_replicas);
+        let ready = svc.status.as_ref().map_or(0, |s| s.ready_replicas);
+        let desired = svc.status.as_ref().map_or(0, |s| s.desired_replicas);
         let image: String = svc
             .status
             .as_ref()
             .and_then(|s| s.current_image.clone())
             .unwrap_or_else(|| {
-                if let fractal_operator::crd::service::ServiceSource::Image {
-                    repository,
-                    tag,
-                } = &svc.spec.source
+                if let fractal_operator::crd::service::ServiceSource::Image { repository, tag } =
+                    &svc.spec.source
                 {
                     format!("{repository}:{tag}")
                 } else {

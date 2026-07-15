@@ -1,6 +1,6 @@
 use anyhow::Result;
-use kube::api::{Api, DeleteParams};
 use kube::Client;
+use kube::api::{Api, DeleteParams};
 
 use fractal_operator::crd::service::FractalService;
 

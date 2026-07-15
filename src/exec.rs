@@ -21,10 +21,9 @@ pub async fn exec_in_service(service: &str, cmd: &[String], tty: bool) -> Result
     let client = Client::try_default().await?;
 
     let svc_api: Api<FractalService> = Api::default_namespaced(client.clone());
-    svc_api
-        .get(service)
-        .await
-        .context(format!("service '{service}' not found in current namespace"))?;
+    svc_api.get(service).await.context(format!(
+        "service '{service}' not found in current namespace"
+    ))?;
 
     let pod_api: Api<Pod> = Api::default_namespaced(client);
     let pods = pod_api

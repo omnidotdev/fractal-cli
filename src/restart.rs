@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use colored::Colorize;
 use k8s_openapi::api::apps::v1::Deployment;
-use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
+use kube::api::{Api, Patch, PatchParams};
 
 use fractal_operator::crd::service::FractalService;
 
@@ -53,11 +53,7 @@ pub async fn restart_service(service: &str) -> Result<()> {
         .await
         .context(format!("failed to restart deployment '{service}'"))?;
 
-    println!(
-        "{} Restarting '{}'",
-        "\u{2713}".green(),
-        service.cyan()
-    );
+    println!("{} Restarting '{}'", "\u{2713}".green(), service.cyan());
 
     Ok(())
 }

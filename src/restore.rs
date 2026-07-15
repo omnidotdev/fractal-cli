@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
-use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
+use kube::api::{Api, Patch, PatchParams};
 
 use fractal_operator::crd::service::FractalService;
 

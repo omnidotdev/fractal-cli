@@ -290,6 +290,16 @@ enum ClusterCommands {
         /// API.
         #[arg(long = "name")]
         name: Option<String>,
+        /// BYOC: registry (host + namespace, e.g. registry.example.com/myorg)
+        /// the operator pushes builds to and pulls runtime images from. Omit
+        /// to deploy onto Omni's hosted cluster. You supply the registry pull
+        /// credential yourself (see the printed instructions); it never
+        /// transits Omni.
+        #[arg(long)]
+        registry: Option<String>,
+        /// BYOC: treat the registry as plaintext HTTP (default is HTTPS).
+        #[arg(long = "registry-insecure")]
+        registry_insecure: bool,
     },
     /// Report whether the fractal-operator is installed and Ready
     Status,
@@ -424,14 +434,17 @@ fn main() -> ExitCode {
             tail,
             grep.as_deref(),
         )),
-        Commands::Exec { service, tty, cmd } => rt.block_on(exec::exec_in_service(&service, &cmd, tty)),
+        Commands::Exec { service, tty, cmd } => {
+            rt.block_on(exec::exec_in_service(&service, &cmd, tty))
+        }
         Commands::PortForward { service, ports } => match parse_ports(&ports) {
             Ok((local, remote)) => rt.block_on(port_forward::port_forward(&service, local, remote)),
             Err(e) => Err(e),
         },
-        Commands::DbConnect { service, print_only } => {
-            rt.block_on(db_connect::db_connect(&service, print_only))
-        }
+        Commands::DbConnect {
+            service,
+            print_only,
+        } => rt.block_on(db_connect::db_connect(&service, print_only)),
         Commands::SecretsSync {
             service,
             output,
@@ -453,13 +466,19 @@ fn main() -> ExitCode {
                 kubeconfig,
                 context,
                 name,
-            } => rt.block_on(cluster::connect(kubeconfig, context, name)),
+                registry,
+                registry_insecure,
+            } => rt.block_on(cluster::connect(
+                kubeconfig,
+                context,
+                name,
+                registry,
+                registry_insecure,
+            )),
             ClusterCommands::Status => rt.block_on(cluster::status()),
             ClusterCommands::Disconnect => rt.block_on(cluster::disconnect()),
             ClusterCommands::ListTokens => rt.block_on(cluster::list_tokens()),
-            ClusterCommands::RevokeToken { id } => {
-                rt.block_on(cluster::revoke_token(&id))
-            }
+            ClusterCommands::RevokeToken { id } => rt.block_on(cluster::revoke_token(&id)),
         },
         Commands::Tokens { action } => match action {
             TokensCommands::List => rt.block_on(tokens::list_tokens()),
@@ -468,7 +487,12 @@ fn main() -> ExitCode {
                 subject,
                 scopes,
                 expires_in_days,
-            } => rt.block_on(tokens::create_token(&name, &subject, scopes, expires_in_days)),
+            } => rt.block_on(tokens::create_token(
+                &name,
+                &subject,
+                scopes,
+                expires_in_days,
+            )),
             TokensCommands::Revoke { name } => rt.block_on(tokens::revoke_token(&name)),
             TokensCommands::Delete { name } => rt.block_on(tokens::delete_token(&name)),
         },
@@ -483,14 +507,10 @@ fn main() -> ExitCode {
             service,
             env,
         } => rt.block_on(deploy::deploy(&namespace, &project, &service, env)),
-        Commands::Services { namespace } => {
-            rt.block_on(services::list_services(namespace))
-        }
+        Commands::Services { namespace } => rt.block_on(services::list_services(namespace)),
         Commands::Projects { action } => match action {
             ProjectsCommands::List => rt.block_on(projects::list_projects()),
-            ProjectsCommands::Get { name } => {
-                rt.block_on(projects::get_project(&name))
-            }
+            ProjectsCommands::Get { name } => rt.block_on(projects::get_project(&name)),
         },
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -504,15 +524,9 @@ fn main() -> ExitCode {
                 image,
                 weight,
             } => rt.block_on(canary::start_canary(&service, &image, weight)),
-            CanaryCommands::Promote { service } => {
-                rt.block_on(canary::promote_canary(&service))
-            }
-            CanaryCommands::Abort { service } => {
-                rt.block_on(canary::abort_canary(&service))
-            }
-            CanaryCommands::Status { service } => {
-                rt.block_on(canary::canary_status(&service))
-            }
+            CanaryCommands::Promote { service } => rt.block_on(canary::promote_canary(&service)),
+            CanaryCommands::Abort { service } => rt.block_on(canary::abort_canary(&service)),
+            CanaryCommands::Status { service } => rt.block_on(canary::canary_status(&service)),
         },
     };
 

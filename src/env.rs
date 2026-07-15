@@ -1,7 +1,7 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use colored::Colorize;
-use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
+use kube::api::{Api, Patch, PatchParams};
 
 use fractal_operator::crd::service::{EnvVar, EnvVarSource, FractalService, SecretRef};
 
@@ -11,9 +11,7 @@ use fractal_operator::crd::service::{EnvVar, EnvVarSource, FractalService, Secre
 ///
 /// Returns an error if the input doesn't contain `=` or the key is empty.
 pub fn parse_key_value(pair: &str) -> Result<(String, String)> {
-    let (key, value) = pair
-        .split_once('=')
-        .context("expected KEY=VALUE format")?;
+    let (key, value) = pair.split_once('=').context("expected KEY=VALUE format")?;
 
     if key.is_empty() {
         bail!("key cannot be empty");
@@ -112,12 +110,7 @@ pub async fn set_env(service: &str, pair: &str) -> Result<()> {
 }
 
 /// Set a secret-ref env var on a service
-pub async fn set_secret_env(
-    service: &str,
-    name: &str,
-    secret: &str,
-    key: &str,
-) -> Result<()> {
+pub async fn set_secret_env(service: &str, name: &str, secret: &str, key: &str) -> Result<()> {
     let client = Client::try_default().await?;
     let api: Api<FractalService> = Api::default_namespaced(client);
     let svc = api
@@ -173,11 +166,7 @@ pub async fn unset_env(service: &str, name: &str) -> Result<()> {
 }
 
 /// Patch the env list on a `FractalService`
-async fn patch_env(
-    api: &Api<FractalService>,
-    service: &str,
-    env: &[EnvVar],
-) -> Result<()> {
+async fn patch_env(api: &Api<FractalService>, service: &str, env: &[EnvVar]) -> Result<()> {
     let patch = serde_json::json!({
         "spec": {
             "deploy": {
@@ -186,13 +175,9 @@ async fn patch_env(
         }
     });
 
-    api.patch(
-        service,
-        &PatchParams::default(),
-        &Patch::Merge(&patch),
-    )
-    .await
-    .context("failed to patch env vars")?;
+    api.patch(service, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .context("failed to patch env vars")?;
 
     Ok(())
 }
