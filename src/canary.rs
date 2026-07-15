@@ -7,8 +7,8 @@
 
 use anyhow::{Context, Result};
 use colored::Colorize;
-use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
+use kube::api::{Api, Patch, PatchParams};
 
 use fractal_operator::crd::service::FractalService;
 
@@ -165,11 +165,7 @@ pub async fn canary_status(service: &str) -> Result<()> {
         .with_context(|| format!("service '{service}' not found"))?;
 
     if let Some(canary) = svc.spec.canary.as_ref() {
-        println!(
-            "{} canary active on {}",
-            "\u{2713}".green(),
-            service.cyan()
-        );
+        println!("{} canary active on {}", "\u{2713}".green(), service.cyan());
         println!("  image:  {}", canary.image.dimmed());
         println!("  weight: {}%", canary.weight);
     } else {

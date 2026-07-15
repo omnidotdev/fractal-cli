@@ -53,8 +53,7 @@ impl Config {
         }
         let contents = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        toml::from_str(&contents)
-            .with_context(|| format!("failed to parse {}", path.display()))
+        toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
     }
 
     /// Persist the config to disk, creating parent directories as
@@ -70,8 +69,7 @@ impl Config {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let serialized =
-            toml::to_string(self).context("failed to serialize config")?;
+        let serialized = toml::to_string(self).context("failed to serialize config")?;
         fs::write(&path, serialized)
             .with_context(|| format!("failed to write {}", path.display()))?;
         #[cfg(unix)]

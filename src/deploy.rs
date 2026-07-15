@@ -35,10 +35,7 @@ pub async fn deploy(
     env: Option<String>,
 ) -> Result<()> {
     let (base, token, client) = api_session()?;
-    let url = format!(
-        "{}/v1/services/rebuild",
-        base.trim_end_matches('/'),
-    );
+    let url = format!("{}/v1/services/rebuild", base.trim_end_matches('/'),);
     let resp = client
         .post(&url)
         .bearer_auth(&token)
@@ -57,7 +54,11 @@ pub async fn deploy(
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!(
             "rebuild endpoint returned {status}: {}",
-            if body.is_empty() { "<empty body>" } else { &body }
+            if body.is_empty() {
+                "<empty body>"
+            } else {
+                &body
+            }
         );
     }
 

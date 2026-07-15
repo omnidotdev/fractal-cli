@@ -4,15 +4,14 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use k8s_openapi::api::core::v1::Node;
 use kube::api::ListParams;
-use kube::config::{Kubeconfig, KubeConfigOptions};
+use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Api, Client, Config};
 
 /// Fallback install bundle URL printed when the per-cluster mint
 /// endpoint isn't reachable (e.g. the user hasn't set `FRACTAL_API_URL`
 /// or `FRACTAL_AUTH_TOKEN`). Lets the CLI still produce a runnable
 /// install command for users on the OSS path.
-const DEFAULT_BUNDLE_URL: &str =
-    "https://fractal.omni.dev/install/operator.yaml";
+const DEFAULT_BUNDLE_URL: &str = "https://fractal.omni.dev/install/operator.yaml";
 
 /// Public base URL of the Fractal API. Used to mint per-cluster install
 /// tokens against `POST /v1/clusters/install-tokens`. Required - the CLI
@@ -83,9 +82,8 @@ pub(crate) fn api_session() -> Result<(String, String, reqwest::Client)> {
     let base = api_url().context(
         "FRACTAL_API_URL not set (point at https://api.fractal.omni.dev or your dev API)",
     )?;
-    let token = auth_token().context(
-        "Not authenticated. Run `fractal auth login` (or set FRACTAL_AUTH_TOKEN).",
-    )?;
+    let token = auth_token()
+        .context("Not authenticated. Run `fractal auth login` (or set FRACTAL_AUTH_TOKEN).")?;
     let client = reqwest::Client::builder()
         .build()
         .context("failed to build HTTP client")?;
@@ -98,9 +96,7 @@ pub(crate) fn api_session() -> Result<(String, String, reqwest::Client)> {
 ///
 /// Returns an error if the API URL or auth token env vars are missing,
 /// the HTTP call fails, or the server returns a non-2xx status.
-async fn mint_install_token(
-    cluster_name: Option<&str>,
-) -> Result<MintTokenResponse> {
+async fn mint_install_token(cluster_name: Option<&str>) -> Result<MintTokenResponse> {
     let (base, token, client) = api_session()?;
     let url = format!("{}/v1/clusters/install-tokens", base.trim_end_matches('/'));
     let resp = client
@@ -116,7 +112,11 @@ async fn mint_install_token(
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!(
             "mint endpoint returned {status}: {}",
-            if body.is_empty() { "<empty body>" } else { &body }
+            if body.is_empty() {
+                "<empty body>"
+            } else {
+                &body
+            }
         );
     }
 
@@ -148,7 +148,11 @@ pub async fn list_tokens() -> Result<()> {
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!(
             "list endpoint returned {status}: {}",
-            if body.is_empty() { "<empty body>" } else { &body }
+            if body.is_empty() {
+                "<empty body>"
+            } else {
+                &body
+            }
         );
     }
 
@@ -219,7 +223,11 @@ pub async fn revoke_token(id: &str) -> Result<()> {
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!(
             "revoke endpoint returned {status}: {}",
-            if body.is_empty() { "<empty body>" } else { &body }
+            if body.is_empty() {
+                "<empty body>"
+            } else {
+                &body
+            }
         );
     }
     println!("{} token {} revoked", "\u{2713}".green(), id.cyan());
@@ -277,24 +285,66 @@ fn resolve_kubeconfig_path_inner(
     Ok(PathBuf::from(home).join(".kube/config"))
 }
 
+/// Append the BYOC registry to a minted install URL as query params. The
+/// registry is non-secret config (host + insecure flag); the pull credential is
+/// customer-managed and never sent here. `/` and `:` are legal unescaped in a
+/// query value and registry refs carry no `&`/`=`/`#`, so no encoding is needed.
+fn install_url_with_registry(base: &str, registry: Option<&str>, insecure: bool) -> String {
+    match registry {
+        Some(reg) => format!("{base}?registry={reg}&registryInsecure={insecure}"),
+        None => base.to_string(),
+    }
+}
+
 /// Mint an install token and print its URL + instructions. Returns
 /// `true` if mint succeeded (caller should skip the static fallback);
 /// `false` if mint failed (caller should print the static fallback).
 /// Errors are logged inline as warnings - this is a soft-fail because
 /// the OSS bundle is still a usable install path.
-async fn try_mint_and_print(cluster_name: Option<&str>) -> bool {
+async fn try_mint_and_print(
+    cluster_name: Option<&str>,
+    registry: Option<&str>,
+    registry_insecure: bool,
+) -> bool {
     match mint_install_token(cluster_name).await {
         Ok(minted) => {
+            let install_url =
+                install_url_with_registry(&minted.install_url, registry, registry_insecure);
             println!(
                 "{} {}):",
                 "Install URL (single-use, expires".bold(),
                 minted.expires_at.bold()
             );
-            println!("  {}", minted.install_url.cyan());
+            println!("  {}", install_url.cyan());
             println!();
+            if let Some(reg) = registry {
+                let host = reg.split('/').next().unwrap_or(reg);
+                println!(
+                    "{}",
+                    "BYOC registry: create the pull credential first (it never transits Omni):"
+                        .bold()
+                );
+                println!(
+                    "  {}",
+                    format!(
+                        "kubectl -n fractal-system create secret docker-registry \
+fractal-registry-credentials --docker-server={host} --docker-username=<user> \
+--docker-password=<pass>"
+                    )
+                    .dimmed()
+                );
+                println!();
+            }
             println!("{}", "To install, run:".bold());
-            for line in minted.instructions.lines() {
-                println!("  {}", line.dimmed());
+            if registry.is_some() {
+                println!(
+                    "  {}",
+                    format!("curl -sSfL '{install_url}' | kubectl apply -f -").dimmed()
+                );
+            } else {
+                for line in minted.instructions.lines() {
+                    println!("  {}", line.dimmed());
+                }
             }
             println!();
             println!(
@@ -337,6 +387,8 @@ pub async fn connect(
     kubeconfig: Option<PathBuf>,
     context: Option<String>,
     cluster_name: Option<String>,
+    registry: Option<String>,
+    registry_insecure: bool,
 ) -> Result<()> {
     let path = resolve_kubeconfig_path(kubeconfig.as_deref())?;
     if !path.exists() {
@@ -404,7 +456,12 @@ pub async fn connect(
 
     if api_url().is_some()
         && auth_token().is_some()
-        && try_mint_and_print(cluster_name.as_deref()).await
+        && try_mint_and_print(
+            cluster_name.as_deref(),
+            registry.as_deref(),
+            registry_insecure,
+        )
+        .await
     {
         return Ok(());
     }
@@ -500,9 +557,7 @@ pub async fn disconnect() -> Result<()> {
         "{} Cluster registration / revocation endpoint not yet deployed.",
         "Note:".yellow().bold(),
     );
-    println!(
-        "  Workloads on this cluster will keep running. To stop the operator,"
-    );
+    println!("  Workloads on this cluster will keep running. To stop the operator,");
     println!(
         "  delete the Deployment in {}: {}",
         "fractal-system".bold(),
@@ -513,8 +568,32 @@ pub async fn disconnect() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_kubeconfig_path_inner;
+    use super::{install_url_with_registry, resolve_kubeconfig_path_inner};
     use std::path::PathBuf;
+
+    #[test]
+    fn install_url_without_registry_is_unchanged() {
+        assert_eq!(
+            install_url_with_registry("https://api/v1/install/tok", None, false),
+            "https://api/v1/install/tok"
+        );
+    }
+
+    #[test]
+    fn install_url_appends_registry_and_insecure() {
+        assert_eq!(
+            install_url_with_registry(
+                "https://api/v1/install/tok",
+                Some("registry.example.com/myorg"),
+                false
+            ),
+            "https://api/v1/install/tok?registry=registry.example.com/myorg&registryInsecure=false"
+        );
+        assert_eq!(
+            install_url_with_registry("https://api/v1/install/tok", Some("r.io/o"), true),
+            "https://api/v1/install/tok?registry=r.io/o&registryInsecure=true"
+        );
+    }
 
     #[test]
     fn explicit_path_wins() {

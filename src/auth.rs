@@ -55,8 +55,7 @@ struct LoginUser {
 pub async fn login() -> Result<()> {
     let base = auth_url();
     let email = prompt("Email: ")?;
-    let password = rpassword::prompt_password("Password: ")
-        .context("failed to read password")?;
+    let password = rpassword::prompt_password("Password: ").context("failed to read password")?;
 
     let client = reqwest::Client::new();
     let resp = client

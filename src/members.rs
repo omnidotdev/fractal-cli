@@ -7,7 +7,9 @@ use fractal_operator::crd::project::{FractalProject, ProjectMember, ProjectRole}
 
 fn parse_role(s: &str) -> Result<ProjectRole> {
     match s.to_ascii_lowercase().as_str() {
-        "owner" => anyhow::bail!("owner cannot be assigned through this command; transfer ownership is a separate operation"),
+        "owner" => anyhow::bail!(
+            "owner cannot be assigned through this command; transfer ownership is a separate operation"
+        ),
         "admin" => Ok(ProjectRole::Admin),
         "developer" | "dev" => Ok(ProjectRole::Developer),
         "viewer" => Ok(ProjectRole::Viewer),
