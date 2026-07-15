@@ -23,10 +23,9 @@ pub async fn sync_secrets(service: &str, output_path: &Path, overwrite: bool) ->
     let client = Client::try_default().await?;
 
     let svc_api: Api<FractalService> = Api::default_namespaced(client.clone());
-    let svc = svc_api
-        .get(service)
-        .await
-        .context(format!("service '{service}' not found in current namespace"))?;
+    let svc = svc_api.get(service).await.context(format!(
+        "service '{service}' not found in current namespace"
+    ))?;
 
     let secret_api: Api<Secret> = Api::default_namespaced(client);
 
@@ -39,7 +38,10 @@ pub async fn sync_secrets(service: &str, output_path: &Path, overwrite: bool) ->
             entries.push((key.clone(), value.clone()));
             continue;
         }
-        let Some(sref) = env_var.value_from.as_ref().and_then(|vf| vf.secret_ref.as_ref())
+        let Some(sref) = env_var
+            .value_from
+            .as_ref()
+            .and_then(|vf| vf.secret_ref.as_ref())
         else {
             continue;
         };

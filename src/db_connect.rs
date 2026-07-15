@@ -22,10 +22,9 @@ pub async fn db_connect(service: &str, print_only: bool) -> Result<()> {
     let client = Client::try_default().await?;
 
     let svc_api: Api<FractalService> = Api::default_namespaced(client.clone());
-    let svc = svc_api
-        .get(service)
-        .await
-        .context(format!("service '{service}' not found in current namespace"))?;
+    let svc = svc_api.get(service).await.context(format!(
+        "service '{service}' not found in current namespace"
+    ))?;
 
     if !matches!(svc.spec.service_type, ServiceType::Database) {
         anyhow::bail!("'{service}' is not a Database service");
@@ -53,7 +52,10 @@ pub async fn db_connect(service: &str, print_only: bool) -> Result<()> {
         // Don't echo the password; print a connection string suitable for
         // pasting into a tool that prompts for the password separately.
         println!("host={host} port={port} user={user} dbname={dbname}");
-        println!("{} (password redacted; available in secret {secret_name})", "info:".dimmed());
+        println!(
+            "{} (password redacted; available in secret {secret_name})",
+            "info:".dimmed()
+        );
         return Ok(());
     }
 
@@ -96,8 +98,7 @@ fn decode_field(
         .ok_or_else(|| anyhow::anyhow!("field '{key}' missing from secret"))?;
     // Secret data is already decoded by the kube client into ByteString,
     // but we still need to interpret the bytes as UTF-8.
-    let s = String::from_utf8(raw.0.clone())
-        .context(format!("field '{key}' is not valid UTF-8"))?;
+    let s =
+        String::from_utf8(raw.0.clone()).context(format!("field '{key}' is not valid UTF-8"))?;
     Ok(s)
 }
-

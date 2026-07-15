@@ -32,10 +32,9 @@ pub async fn tail_logs(
     // kubeconfig context (user is expected to `kubectl config set
     // namespace fractal-{project}` before invoking).
     let svc_api: Api<FractalService> = Api::default_namespaced(client.clone());
-    svc_api
-        .get(service)
-        .await
-        .context(format!("service '{service}' not found in current namespace"))?;
+    svc_api.get(service).await.context(format!(
+        "service '{service}' not found in current namespace"
+    ))?;
 
     let pod_api: Api<Pod> = Api::default_namespaced(client);
     let pods = pod_api

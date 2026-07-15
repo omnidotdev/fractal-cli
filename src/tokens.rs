@@ -6,9 +6,7 @@ use kube::{Client, ResourceExt};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 
-use fractal_operator::crd::api_token::{
-    FractalApiToken, FractalApiTokenSpec, hash_token,
-};
+use fractal_operator::crd::api_token::{FractalApiToken, FractalApiTokenSpec, hash_token};
 
 /// Namespace where tokens live. Tokens are workspace-scoped, not
 /// project-scoped, so they all land in a single namespace per workspace.
@@ -52,14 +50,12 @@ fn generate_plaintext_token() -> String {
 /// `name` label can repeat across projects, but the CR name has to be
 /// unique within `fractal-system`.
 fn token_resource_name(label: &str) -> String {
-    let suffix: String = generate_plaintext_token()
-        .chars()
-        .skip(4)
-        .take(8)
-        .collect();
+    let suffix: String = generate_plaintext_token().chars().skip(4).take(8).collect();
     format!(
         "{}-{}",
-        label.to_ascii_lowercase().replace(|c: char| !c.is_alphanumeric(), "-"),
+        label
+            .to_ascii_lowercase()
+            .replace(|c: char| !c.is_alphanumeric(), "-"),
         suffix
     )
 }
@@ -114,15 +110,13 @@ pub async fn create_token(
     println!();
     println!(
         "{} {}",
-        "Token (copy now -- it will not be shown again):".bold().red(),
+        "Token (copy now -- it will not be shown again):"
+            .bold()
+            .red(),
         plaintext.cyan()
     );
     println!();
-    println!(
-        "  {} {}",
-        "Resource name:".bold(),
-        resource_name.dimmed()
-    );
+    println!("  {} {}", "Resource name:".bold(), resource_name.dimmed());
     Ok(())
 }
 

@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result};
 use colored::Colorize;
-use kube::api::{Api, ListParams};
 use kube::Client;
+use kube::api::{Api, ListParams};
 
 use fractal_operator::crd::project::FractalProject;
 

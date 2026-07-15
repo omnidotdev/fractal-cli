@@ -1,7 +1,7 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use colored::Colorize;
-use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
+use kube::api::{Api, Patch, PatchParams};
 
 use fractal_operator::crd::service::FractalService;
 
