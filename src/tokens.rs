@@ -83,6 +83,10 @@ pub async fn create_token(
         name: label.to_string(),
         subject: subject.to_string(),
         scopes,
+        // Personal token (acts only as `subject`); the CLI has no org flag yet.
+        // The field is `#[serde(default)]`, so empty is the backward-compatible
+        // personal-token default
+        organizations: Vec::new(),
         token_hash: hash_token(&plaintext),
         expires_at: expires_at.clone(),
         issued_at: now.to_rfc3339(),
