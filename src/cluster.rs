@@ -14,11 +14,12 @@ use kube::{Api, Client, Config};
 const DEFAULT_BUNDLE_URL: &str = "https://fractal.omni.dev/install/operator.yaml";
 
 /// Public base URL of the Fractal API. Used to mint per-cluster install
-/// tokens against `POST /v1/clusters/install-tokens`. Required - the CLI
-/// has no embedded default because production and dev hit different
-/// hosts.
-fn api_url() -> Option<String> {
-    std::env::var("FRACTAL_API_URL").ok()
+/// tokens against `POST /v1/clusters/install-tokens`. Defaults to
+/// production; override with `FRACTAL_API_URL` to point at a dev API.
+const DEFAULT_API_URL: &str = "https://api.fractal.omni.dev";
+
+fn api_url() -> String {
+    std::env::var("FRACTAL_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string())
 }
 
 /// Gatekeeper-issued bearer token used to authenticate the mint call.
@@ -79,9 +80,7 @@ struct ListedInstallTokensResponse {
 /// `pub(crate)` so sibling commands (deploy, etc) can reuse the same
 /// auth resolution.
 pub(crate) fn api_session() -> Result<(String, String, reqwest::Client)> {
-    let base = api_url().context(
-        "FRACTAL_API_URL not set (point at https://api.fractal.omni.dev or your dev API)",
-    )?;
+    let base = api_url();
     let token = auth_token()
         .context("Not authenticated. Run `fractal auth login` (or set FRACTAL_AUTH_TOKEN).")?;
     let client = reqwest::Client::builder()
@@ -454,8 +453,7 @@ pub async fn connect(
 
     println!();
 
-    if api_url().is_some()
-        && auth_token().is_some()
+    if auth_token().is_some()
         && try_mint_and_print(
             cluster_name.as_deref(),
             registry.as_deref(),
