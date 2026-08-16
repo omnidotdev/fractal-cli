@@ -10,7 +10,7 @@ use fractal_operator::crd::service::FractalService;
 
 /// Sync a service's environment variables to a local `.env` file.
 ///
-/// Resolves the FractalService's env spec, follows any `secretRef`
+/// Resolves the `FractalService`'s env spec, follows any `secretRef`
 /// indirections to the backing K8s Secrets, and writes a flat
 /// `KEY=value` file at `output_path`. Existing values in that file are
 /// preserved if `--overwrite` is not set.
@@ -62,17 +62,16 @@ pub async fn sync_secrets(service: &str, output_path: &Path, overwrite: bool) ->
             .as_ref()
             .and_then(|d| d.get(&sref.key))
             .and_then(|raw| String::from_utf8(raw.0.clone()).ok());
-        match value {
-            Some(v) => entries.push((key.clone(), v)),
-            None => {
-                eprintln!(
-                    "{} secret '{}' has no key '{}'",
-                    "warning:".yellow(),
-                    sref.name,
-                    sref.key,
-                );
-                redacted.push(key.clone());
-            }
+        if let Some(v) = value {
+            entries.push((key.clone(), v));
+        } else {
+            eprintln!(
+                "{} secret '{}' has no key '{}'",
+                "warning:".yellow(),
+                sref.name,
+                sref.key,
+            );
+            redacted.push(key.clone());
         }
     }
 
@@ -126,6 +125,8 @@ fn read_existing(path: &Path) -> Result<Vec<(String, String)>> {
 }
 
 fn write_env_file(path: &Path, vars: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    use std::fmt::Write as _;
+
     let mut body = String::new();
     for (k, v) in vars {
         // Quote values containing whitespace or special chars so they
@@ -136,9 +137,9 @@ fn write_env_file(path: &Path, vars: &std::collections::BTreeMap<String, String>
             .any(|c| c.is_whitespace() || c == '#' || c == '"' || c == '$');
         if needs_quote {
             let escaped = v.replace('\'', "'\\''");
-            body.push_str(&format!("{k}='{escaped}'\n"));
+            let _ = writeln!(body, "{k}='{escaped}'");
         } else {
-            body.push_str(&format!("{k}={v}\n"));
+            let _ = writeln!(body, "{k}={v}");
         }
     }
     std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;

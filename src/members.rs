@@ -17,7 +17,7 @@ fn parse_role(s: &str) -> Result<ProjectRole> {
     }
 }
 
-fn format_role(role: ProjectRole) -> &'static str {
+const fn format_role(role: ProjectRole) -> &'static str {
     match role {
         ProjectRole::Owner => "owner",
         ProjectRole::Admin => "admin",

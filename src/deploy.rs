@@ -1,4 +1,4 @@
-//! `fractal deploy` - trigger a rebuild on a FractalService via the
+//! `fractal deploy` - trigger a rebuild on a `FractalService` via the
 //! authed fractal-api endpoint. Designed for CI use; the existing
 //! `fractal restart` does the same job via kubectl, but assumes the
 //! caller has cluster RBAC. `deploy` goes through fractal-api's
@@ -19,8 +19,8 @@ struct RebuildRequest<'a> {
     env: Option<&'a str>,
 }
 
-/// Trigger a rebuild on `namespace/service` (a FractalService).
-/// `project` is the parent FractalProject name (used for RBAC) and
+/// Trigger a rebuild on `namespace/service` (a `FractalService`).
+/// `project` is the parent `FractalProject` name (used for RBAC) and
 /// `env` optionally narrows the rebuild to a single environment.
 ///
 /// # Errors

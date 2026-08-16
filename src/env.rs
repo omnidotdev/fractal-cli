@@ -62,16 +62,13 @@ pub async fn list_env(service: &str) -> Result<()> {
     );
 
     for env in envs {
-        let (source, value) = if let Some(v) = &env.value {
-            ("literal", v.clone())
-        } else if let Some(vf) = &env.value_from {
-            if let Some(sr) = &vf.secret_ref {
-                ("secret", format!("{}:{} (masked)", sr.name, sr.key))
-            } else {
-                ("unknown", "—".to_string())
-            }
-        } else {
-            ("empty", "—".to_string())
+        let (source, value) = match (&env.value, &env.value_from) {
+            (Some(v), _) => ("literal", v.clone()),
+            (None, Some(vf)) => vf.secret_ref.as_ref().map_or_else(
+                || ("unknown", "—".to_string()),
+                |sr| ("secret", format!("{}:{} (masked)", sr.name, sr.key)),
+            ),
+            (None, None) => ("empty", "—".to_string()),
         };
 
         println!("{:<20} {:<12} {}", env.name, source, value);

@@ -77,9 +77,9 @@ struct ListedInstallTokensResponse {
 }
 
 /// Shared helper: build a reqwest client + resolve API URL + token.
-/// `pub(crate)` so sibling commands (deploy, etc) can reuse the same
-/// auth resolution.
-pub(crate) fn api_session() -> Result<(String, String, reqwest::Client)> {
+/// Public so sibling commands (deploy, etc) can reuse the same auth
+/// resolution.
+pub fn api_session() -> Result<(String, String, reqwest::Client)> {
     let base = api_url();
     let token = auth_token()
         .context("Not authenticated. Run `fractal auth login` (or set FRACTAL_AUTH_TOKEN).")?;
@@ -237,13 +237,17 @@ pub async fn revoke_token(id: &str) -> Result<()> {
 /// per the DB column default, but defending against arbitrary input is
 /// cheap and avoids surprises if the id format ever changes.
 fn urlencode_path_segment(s: &str) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(byte as char);
             }
-            _ => out.push_str(&format!("%{byte:02X}")),
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
         }
     }
     out
@@ -289,10 +293,10 @@ fn resolve_kubeconfig_path_inner(
 /// customer-managed and never sent here. `/` and `:` are legal unescaped in a
 /// query value and registry refs carry no `&`/`=`/`#`, so no encoding is needed.
 fn install_url_with_registry(base: &str, registry: Option<&str>, insecure: bool) -> String {
-    match registry {
-        Some(reg) => format!("{base}?registry={reg}&registryInsecure={insecure}"),
-        None => base.to_string(),
-    }
+    registry.map_or_else(
+        || base.to_string(),
+        |reg| format!("{base}?registry={reg}&registryInsecure={insecure}"),
+    )
 }
 
 /// Mint an install token and print its URL + instructions. Returns

@@ -147,13 +147,13 @@ enum Commands {
         #[command(subcommand)]
         action: CanaryCommands,
     },
-    /// List all FractalServices in a namespace
+    /// List all `FractalService`s in a namespace
     Services {
         /// Namespace (defaults to current kubeconfig namespace)
         #[arg(long, short = 'n')]
         namespace: Option<String>,
     },
-    /// Inspect FractalProject resources
+    /// Inspect `FractalProject` resources
     Projects {
         #[command(subcommand)]
         action: ProjectsCommands,
@@ -161,26 +161,26 @@ enum Commands {
     /// Generate shell completion script for the given shell. Pipe to
     /// the shell's completion directory; e.g.:
     ///   fractal completions zsh > ~/.zfunc/_fractal
-    ///   fractal completions bash | sudo tee /etc/bash_completion.d/fractal
+    ///   fractal completions bash | sudo tee `/etc/bash_completion.d/fractal`
     ///   fractal completions fish > ~/.config/fish/completions/fractal.fish
     Completions {
         /// Shell to generate completions for
         shell: Shell,
     },
-    /// Trigger a rebuild on a FractalService via fractal-api (CI use).
+    /// Trigger a rebuild on a `FractalService` via fractal-api (CI use).
     ///
     /// Unlike `restart`, this goes through the authed HTTP endpoint
     /// (Gatekeeper JWT + project-developer role) instead of patching
     /// the K8s Deployment directly, so it works from CI runners that
     /// don't have cluster RBAC.
     Deploy {
-        /// Namespace the FractalService lives in (e.g. fractal-myproject)
+        /// Namespace the `FractalService` lives in (e.g. fractal-myproject)
         #[arg(long)]
         namespace: String,
-        /// Parent FractalProject name (used for RBAC)
+        /// Parent `FractalProject` name (used for RBAC)
         #[arg(long)]
         project: String,
-        /// FractalService name to rebuild
+        /// `FractalService` name to rebuild
         #[arg(long)]
         service: String,
         /// Optional environment to target (e.g. "production")
@@ -191,11 +191,11 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ProjectsCommands {
-    /// List all FractalProject resources
+    /// List all `FractalProject` resources
     List,
     /// Show a single project's spec + status (namespaces, members, phase)
     Get {
-        /// Project name (FractalProject metadata.name)
+        /// Project name (`FractalProject` metadata.name)
         name: String,
     },
 }
@@ -402,7 +402,17 @@ fn main() -> ExitCode {
         }
     };
 
-    let result = match cli.command {
+    match dispatch(cli.command, &rt) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn dispatch(command: Commands, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    match command {
         Commands::Scale { service, replicas } => {
             rt.block_on(scale::scale_service(&service, replicas))
         }
@@ -410,17 +420,7 @@ fn main() -> ExitCode {
         Commands::Rollback { service } => rt.block_on(rollback::rollback_service(&service)),
         Commands::Destroy { service } => rt.block_on(destroy::destroy_service(&service)),
         Commands::Restore { service } => rt.block_on(restore::restore_service(&service)),
-        Commands::Env { action } => match action {
-            EnvCommands::List { service } => rt.block_on(env::list_env(&service)),
-            EnvCommands::Set { service, pair } => rt.block_on(env::set_env(&service, &pair)),
-            EnvCommands::SetSecret {
-                service,
-                name,
-                secret,
-                key,
-            } => rt.block_on(env::set_secret_env(&service, &name, &secret, &key)),
-            EnvCommands::Unset { service, name } => rt.block_on(env::unset_env(&service, &name)),
-        },
+        Commands::Env { action } => dispatch_env(action, rt),
         Commands::Logs {
             service,
             follow,
@@ -450,52 +450,9 @@ fn main() -> ExitCode {
             output,
             overwrite,
         } => rt.block_on(secrets_sync::sync_secrets(&service, &output, overwrite)),
-        Commands::Members { action } => match action {
-            MembersCommands::List { project } => rt.block_on(members::list_members(&project)),
-            MembersCommands::Add {
-                project,
-                user,
-                role,
-            } => rt.block_on(members::add_member(&project, &user, &role)),
-            MembersCommands::Remove { project, user } => {
-                rt.block_on(members::remove_member(&project, &user))
-            }
-        },
-        Commands::Cluster { action } => match action {
-            ClusterCommands::Connect {
-                kubeconfig,
-                context,
-                name,
-                registry,
-                registry_insecure,
-            } => rt.block_on(cluster::connect(
-                kubeconfig,
-                context,
-                name,
-                registry,
-                registry_insecure,
-            )),
-            ClusterCommands::Status => rt.block_on(cluster::status()),
-            ClusterCommands::Disconnect => rt.block_on(cluster::disconnect()),
-            ClusterCommands::ListTokens => rt.block_on(cluster::list_tokens()),
-            ClusterCommands::RevokeToken { id } => rt.block_on(cluster::revoke_token(&id)),
-        },
-        Commands::Tokens { action } => match action {
-            TokensCommands::List => rt.block_on(tokens::list_tokens()),
-            TokensCommands::Create {
-                name,
-                subject,
-                scopes,
-                expires_in_days,
-            } => rt.block_on(tokens::create_token(
-                &name,
-                &subject,
-                scopes,
-                expires_in_days,
-            )),
-            TokensCommands::Revoke { name } => rt.block_on(tokens::revoke_token(&name)),
-            TokensCommands::Delete { name } => rt.block_on(tokens::delete_token(&name)),
-        },
+        Commands::Members { action } => dispatch_members(action, rt),
+        Commands::Cluster { action } => dispatch_cluster(action, rt),
+        Commands::Tokens { action } => dispatch_tokens(action, rt),
         Commands::Auth { action } => match action {
             AuthCommands::Login => rt.block_on(auth::login()),
             AuthCommands::Logout => auth::logout(),
@@ -518,23 +475,88 @@ fn main() -> ExitCode {
             generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
             Ok(())
         }
-        Commands::Canary { action } => match action {
-            CanaryCommands::Start {
-                service,
-                image,
-                weight,
-            } => rt.block_on(canary::start_canary(&service, &image, weight)),
-            CanaryCommands::Promote { service } => rt.block_on(canary::promote_canary(&service)),
-            CanaryCommands::Abort { service } => rt.block_on(canary::abort_canary(&service)),
-            CanaryCommands::Status { service } => rt.block_on(canary::canary_status(&service)),
-        },
-    };
+        Commands::Canary { action } => dispatch_canary(action, rt),
+    }
+}
 
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            ExitCode::FAILURE
+fn dispatch_env(action: EnvCommands, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    match action {
+        EnvCommands::List { service } => rt.block_on(env::list_env(&service)),
+        EnvCommands::Set { service, pair } => rt.block_on(env::set_env(&service, &pair)),
+        EnvCommands::SetSecret {
+            service,
+            name,
+            secret,
+            key,
+        } => rt.block_on(env::set_secret_env(&service, &name, &secret, &key)),
+        EnvCommands::Unset { service, name } => rt.block_on(env::unset_env(&service, &name)),
+    }
+}
+
+fn dispatch_members(action: MembersCommands, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    match action {
+        MembersCommands::List { project } => rt.block_on(members::list_members(&project)),
+        MembersCommands::Add {
+            project,
+            user,
+            role,
+        } => rt.block_on(members::add_member(&project, &user, &role)),
+        MembersCommands::Remove { project, user } => {
+            rt.block_on(members::remove_member(&project, &user))
         }
+    }
+}
+
+fn dispatch_cluster(action: ClusterCommands, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    match action {
+        ClusterCommands::Connect {
+            kubeconfig,
+            context,
+            name,
+            registry,
+            registry_insecure,
+        } => rt.block_on(cluster::connect(
+            kubeconfig,
+            context,
+            name,
+            registry,
+            registry_insecure,
+        )),
+        ClusterCommands::Status => rt.block_on(cluster::status()),
+        ClusterCommands::Disconnect => rt.block_on(cluster::disconnect()),
+        ClusterCommands::ListTokens => rt.block_on(cluster::list_tokens()),
+        ClusterCommands::RevokeToken { id } => rt.block_on(cluster::revoke_token(&id)),
+    }
+}
+
+fn dispatch_tokens(action: TokensCommands, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    match action {
+        TokensCommands::List => rt.block_on(tokens::list_tokens()),
+        TokensCommands::Create {
+            name,
+            subject,
+            scopes,
+            expires_in_days,
+        } => rt.block_on(tokens::create_token(
+            &name,
+            &subject,
+            scopes,
+            expires_in_days,
+        )),
+        TokensCommands::Revoke { name } => rt.block_on(tokens::revoke_token(&name)),
+        TokensCommands::Delete { name } => rt.block_on(tokens::delete_token(&name)),
+    }
+}
+
+fn dispatch_canary(action: CanaryCommands, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    match action {
+        CanaryCommands::Start {
+            service,
+            image,
+            weight,
+        } => rt.block_on(canary::start_canary(&service, &image, weight)),
+        CanaryCommands::Promote { service } => rt.block_on(canary::promote_canary(&service)),
+        CanaryCommands::Abort { service } => rt.block_on(canary::abort_canary(&service)),
+        CanaryCommands::Status { service } => rt.block_on(canary::canary_status(&service)),
     }
 }

@@ -48,11 +48,7 @@ pub async fn list_projects() -> Result<()> {
             .unwrap_or("(unknown)")
             .to_string();
         let owner = proj.spec.owner.clone();
-        let phase = proj
-            .status
-            .as_ref()
-            .map(|s| s.phase.as_str())
-            .unwrap_or("Pending");
+        let phase = proj.status.as_ref().map_or("Pending", |s| s.phase.as_str());
         let namespaces: Vec<String> = if proj.spec.environments.is_empty() {
             vec![format!("fractal-{name}")]
         } else {
@@ -102,7 +98,13 @@ pub async fn get_project(name: &str) -> Result<()> {
     if let Some(phase) = proj.status.as_ref().map(|s| s.phase.as_str()) {
         println!("  {} {phase}", "Phase:".bold());
     }
-    if !proj.spec.environments.is_empty() {
+    if proj.spec.environments.is_empty() {
+        println!(
+            "  {} {}",
+            "Namespace:".bold(),
+            format!("fractal-{name}").dimmed()
+        );
+    } else {
         println!("  {}", "Environments:".bold());
         for env in &proj.spec.environments {
             println!(
@@ -111,12 +113,6 @@ pub async fn get_project(name: &str) -> Result<()> {
                 env.name.dimmed()
             );
         }
-    } else {
-        println!(
-            "  {} {}",
-            "Namespace:".bold(),
-            format!("fractal-{name}").dimmed()
-        );
     }
     if !proj.spec.members.is_empty() {
         println!("  {} {}", "Members:".bold(), proj.spec.members.len());
