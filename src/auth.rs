@@ -83,7 +83,7 @@ pub async fn login() -> Result<()> {
         .token
         .ok_or_else(|| anyhow::anyhow!("login response had no `token` field"))?;
 
-    let user = data.user.unwrap_or(LoginUser {
+    let user = data.user.unwrap_or_else(|| LoginUser {
         id: None,
         email: Some(email.clone()),
     });
@@ -91,7 +91,7 @@ pub async fn login() -> Result<()> {
     let mut cfg = Config::load()?;
     cfg.auth.access_token = Some(token);
     cfg.auth.user_id = user.id;
-    cfg.auth.email = user.email.clone().or(Some(email.clone()));
+    cfg.auth.email = user.email.clone().or_else(|| Some(email.clone()));
     cfg.save()?;
 
     println!(

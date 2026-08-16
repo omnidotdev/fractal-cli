@@ -48,11 +48,7 @@ pub async fn list_services(namespace: Option<String>) -> Result<()> {
             .as_deref()
             .unwrap_or("(unknown)")
             .to_string();
-        let phase = svc
-            .status
-            .as_ref()
-            .map(|s| s.phase.as_str())
-            .unwrap_or("Pending");
+        let phase = svc.status.as_ref().map_or("Pending", |s| s.phase.as_str());
         let ready = svc.status.as_ref().map_or(0, |s| s.ready_replicas);
         let desired = svc.status.as_ref().map_or(0, |s| s.desired_replicas);
         let image: String = svc

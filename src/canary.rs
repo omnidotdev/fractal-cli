@@ -1,16 +1,16 @@
 //! `fractal canary start | promote | abort | status` -- drive
 //! `FractalService.spec.canary` from the CLI without kubectl.
 //!
-//! All operations patch the FractalService CR via kube-rs. Operator
+//! All operations patch the `FractalService` CR via kube-rs. Operator
 //! commit 1c0d64b acts on `spec.canary` by spinning up a second
-//! Deployment + Service and weighting the HTTPRoute backendRefs.
+//! Deployment + Service and weighting the `HTTPRoute` backendRefs.
 
 use anyhow::{Context, Result};
 use colored::Colorize;
 use kube::Client;
 use kube::api::{Api, Patch, PatchParams};
 
-use fractal_operator::crd::service::FractalService;
+use fractal_operator::crd::service::{FractalService, ServiceSource};
 
 /// Start a canary rollout on `service` with `image` at `weight`%
 /// traffic. Idempotent: subsequent calls update the existing canary.
@@ -81,7 +81,6 @@ pub async fn promote_canary(service: &str) -> Result<()> {
     // letting the operator's normal build path catch up on the next
     // push. We only handle the explicit image case here; bail with a
     // clear error otherwise.
-    use fractal_operator::crd::service::ServiceSource;
     let promoted_image = canary.image.clone();
     let new_repo_tag = promoted_image.rsplit_once(':');
     let patch = match (&svc.spec.source, new_repo_tag) {
