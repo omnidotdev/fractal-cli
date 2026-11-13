@@ -14,7 +14,7 @@ It talks to two things: your cluster's Kubernetes apiserver (via your kubeconfig
 
 ### Prebuilt binary (recommended)
 
-Every push to `master` publishes static `fractal` binaries for Linux and macOS (amd64 + arm64) to the [GitHub Releases](https://github.com/omnidotdev/fractal-stack/releases) of the `fractal-stack` monorepo, tagged `cli-v<build-number>`. Download the one for your platform, mark it executable, and put it on your `PATH`.
+Every push to `master` publishes `fractal` binaries for Linux (glibc) and macOS (amd64 + arm64) to the [GitHub Releases](https://github.com/omnidotdev/fractal-stack/releases) of the `fractal-stack` monorepo, tagged `cli-v<build-number>`. Download the one for your platform, mark it executable, and put it on your `PATH`.
 
 ```sh
 # Linux (amd64)
