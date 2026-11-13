@@ -1,16 +1,13 @@
 name: Release 🏗️
 
-# Build static `fractal` binaries for Linux and macOS (amd64 + arm64) on every
-# push to master and publish them to the fractal-stack monorepo's GitHub
-# Releases, tagged `cli-v<run-number>`. The CLI is developed in this standalone
-# repo but its binaries live in the monorepo releases so there is one download
-# home for the whole stack (see the install section of the README). Publishing
-# cross-repo uses the org-wide GH_PAT, since the default GITHUB_TOKEN is scoped
-# to this repo only.
+# Build `fractal` binaries for Linux (glibc) and macOS (amd64 + arm64) on every
+# push to master and publish them to this repo's GitHub Releases, tagged
+# `cli-v<run-number>` (see the install section of the README).
 #
 # This crate has `fractal-operator = { path = "../fractal-operator" }`, so the
-# build checks out fractal-operator as a sibling directory to resolve that path
-# dependency, matching the on-disk monorepo layout.
+# build checks out the private fractal-operator repo (via the org-wide GH_PAT)
+# as a sibling directory to resolve that path dependency, matching the on-disk
+# monorepo layout.
 
 on:
   push:
@@ -87,6 +84,8 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     timeout-minutes: 20
     steps:
       - uses: actions/download-artifact@v4
@@ -103,8 +102,6 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          repository: omnidotdev/fractal-stack
-          token: ${{ secrets.GH_PAT }}
           tag_name: cli-v${{ github.run_number }}
           name: Fractal CLI (build ${{ github.run_number }})
           files: release/*

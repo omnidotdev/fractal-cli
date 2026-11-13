@@ -14,20 +14,20 @@ It talks to two things: your cluster's Kubernetes apiserver (via your kubeconfig
 
 ### Prebuilt binary (recommended)
 
-Every push to `master` publishes `fractal` binaries for Linux (glibc) and macOS (amd64 + arm64) to the [GitHub Releases](https://github.com/omnidotdev/fractal-stack/releases) of the `fractal-stack` monorepo, tagged `cli-v<build-number>`. Download the one for your platform, mark it executable, and put it on your `PATH`.
+Every push to `master` publishes `fractal` binaries for Linux (glibc) and macOS (amd64 + arm64) to this repo's [GitHub Releases](https://github.com/omnidotdev/fractal-cli/releases), tagged `cli-v<build-number>`. Download the one for your platform, mark it executable, and put it on your `PATH`.
 
 ```sh
 # Linux (amd64)
-curl -sSfL https://github.com/omnidotdev/fractal-stack/releases/latest/download/fractal-linux-amd64 -o fractal
+curl -sSfL https://github.com/omnidotdev/fractal-cli/releases/latest/download/fractal-linux-amd64 -o fractal
 
 # Linux (arm64)
-curl -sSfL https://github.com/omnidotdev/fractal-stack/releases/latest/download/fractal-linux-arm64 -o fractal
+curl -sSfL https://github.com/omnidotdev/fractal-cli/releases/latest/download/fractal-linux-arm64 -o fractal
 
 # macOS (Apple Silicon / arm64)
-curl -sSfL https://github.com/omnidotdev/fractal-stack/releases/latest/download/fractal-darwin-arm64 -o fractal
+curl -sSfL https://github.com/omnidotdev/fractal-cli/releases/latest/download/fractal-darwin-arm64 -o fractal
 
 # macOS (Intel / amd64)
-curl -sSfL https://github.com/omnidotdev/fractal-stack/releases/latest/download/fractal-darwin-amd64 -o fractal
+curl -sSfL https://github.com/omnidotdev/fractal-cli/releases/latest/download/fractal-darwin-amd64 -o fractal
 
 chmod +x fractal
 sudo mv fractal /usr/local/bin/fractal
@@ -40,7 +40,7 @@ Homebrew, AUR, and cargo-registry packages are not yet available.
 
 ### Build from source
 
-The CLI lives in the `fractal-stack` monorepo under `services/fractal-cli` (it has a path dependency on the sibling `services/fractal-operator` crate, so build it from inside the checkout, not as a standalone clone).
+The CLI lives in the `fractal-stack` monorepo under `services/fractal-cli` (it has a path dependency on the sibling `services/fractal-operator` crate, so build it from inside the checkout, not as a standalone clone). The monorepo and operator are private, so building from source requires Omni org access; everyone else should use the prebuilt binaries above.
 
 ```sh
 git clone git@github.com:omnidotdev/fractal-stack.git
