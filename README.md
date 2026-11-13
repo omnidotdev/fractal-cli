@@ -12,31 +12,41 @@ It talks to two things: your cluster's Kubernetes apiserver (via your kubeconfig
 
 ## Installation
 
-The crate is published to Omni's Manifold cargo registry. Add the registry to `~/.cargo/config.toml` once:
+### Prebuilt binary (recommended)
 
-```toml
-[registries.manifold]
-index = "sparse+https://api.manifold.omni.dev/cargo/omnidotdev/index/"
-
-[registry]
-global-credential-providers = ["cargo:token"]
-```
-
-Then install:
+Every push to `master` publishes static `fractal` binaries for Linux and macOS (amd64 + arm64) to the [GitHub Releases](https://github.com/omnidotdev/fractal-stack/releases) of the `fractal-stack` monorepo, tagged `cli-v<build-number>`. Download the one for your platform, mark it executable, and put it on your `PATH`.
 
 ```sh
-cargo install fractal-cli --registry manifold
+# Linux (amd64)
+curl -sSfL https://github.com/omnidotdev/fractal-stack/releases/latest/download/fractal-linux-amd64 -o fractal
+
+# Linux (arm64)
+curl -sSfL https://github.com/omnidotdev/fractal-stack/releases/latest/download/fractal-linux-arm64 -o fractal
+
+# macOS (Apple Silicon / arm64)
+curl -sSfL https://github.com/omnidotdev/fractal-stack/releases/latest/download/fractal-darwin-arm64 -o fractal
+
+# macOS (Intel / amd64)
+curl -sSfL https://github.com/omnidotdev/fractal-stack/releases/latest/download/fractal-darwin-amd64 -o fractal
+
+chmod +x fractal
+sudo mv fractal /usr/local/bin/fractal
+fractal --version
 ```
 
-Homebrew and AUR packages are not yet available.
+To pin a specific build, swap `latest/download` for `download/cli-v<build-number>` (e.g. `download/cli-v42`); the available builds are listed on the releases page.
+
+Homebrew, AUR, and cargo-registry packages are not yet available.
 
 ### Build from source
 
+The CLI lives in the `fractal-stack` monorepo under `services/fractal-cli` (it has a path dependency on the sibling `services/fractal-operator` crate, so build it from inside the checkout, not as a standalone clone).
+
 ```sh
-git clone https://github.com/omnidotdev/fractal-cli
-cd fractal-cli
+git clone git@github.com:omnidotdev/fractal-stack.git
+cd fractal-stack/services/fractal-cli
 cargo build --release
-# binary will be at target/release/fractal
+# binary will be at target/release/fractal (relative to this directory)
 ```
 
 ## Quick Start
@@ -54,11 +64,35 @@ fractal logs my-service --follow
 
 Run `fractal --help` (or `fractal <command> --help`) for the full command list, which includes `scale`, `restart`, `rollback`, `destroy`/`restore`, `env`, `logs`, `exec`, `port-forward`, `db-connect`, `secrets-sync`, `members`, `projects`, `services`, `deploy`, `canary`, `tokens`, `cluster`, and shell `completions`.
 
+## Machine-readable output (`--json`)
+
+Pass the global `--json` flag to get structured JSON instead of the human-formatted tables, for scripting and agent/CI use. It is honored by the read commands:
+
+```sh
+fractal --json services                 # JSON array of services
+fractal --json projects list            # JSON array of projects
+fractal --json projects get my-project  # JSON object for one project
+fractal --json auth whoami              # { authenticated, source, email, ... }
+fractal --json logs my-service          # stream metadata line, then NDJSON log lines
+```
+
+The `services` JSON rows surface a few fields the human table omits, so CI can discover a service's shape without cluster access to the raw `FractalService`: `serviceType` (`web`, `worker`, `cronJob`, `staticSite`, `database`), the monorepo build subdir `rootDir`, the webhook `watchPaths`, and the cron `schedule`. Commands without a `--json` implementation keep their human output.
+
+> The CLI reads and operates existing services (including monorepo and cron ones); it does not create them. Declare a new service's `serviceType: cronJob` + `schedule`, or its monorepo `rootDir`/`watchPaths`, in a repo-committed `fractal.yaml` or through the dashboard, then deploy it. The read commands above then expose those fields for scripting.
+
 ## Authentication
 
 `fractal auth login` prompts for your email and password, exchanges them for a bearer token, and persists it (mode 0600 on Unix) at `$XDG_CONFIG_HOME/fractal/config.toml` (defaulting to `~/.config/fractal/config.toml`). `fractal auth whoami` prints the stored identity and `fractal auth logout` clears the token.
 
-For CI and automation, set `FRACTAL_AUTH_TOKEN` instead of logging in interactively.
+### CI and automation
+
+Set `FRACTAL_AUTH_TOKEN` to a service-account token (mint one with `fractal tokens create`) instead of logging in interactively. The env token takes precedence over any persisted login and is picked up by every command that calls the control-plane API (`deploy`, `cluster connect`, and so on). When it is set, `fractal auth login` detects it and returns immediately without prompting, so it is safe to call unattended; `fractal auth whoami` reports `source: "env"`. A typical CI step:
+
+```sh
+export FRACTAL_AUTH_TOKEN="$FRACTAL_CI_TOKEN"
+fractal --json auth whoami   # sanity-check the token is accepted
+fractal deploy --namespace fractal-myproject --project myproject --service my-api
+```
 
 ## Configuration
 

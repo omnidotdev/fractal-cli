@@ -30,6 +30,12 @@ use clap_complete::{Shell, generate};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    /// Emit machine-readable JSON instead of human-formatted output.
+    /// Honored by the read commands: `services`, `projects list`/`get`,
+    /// `auth whoami`, and `logs` (stream metadata plus NDJSON lines).
+    /// Other commands ignore it and keep their human output.
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -402,7 +408,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match dispatch(cli.command, &rt) {
+    match dispatch(cli.command, cli.json, &rt) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -411,7 +417,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch(command: Commands, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+fn dispatch(command: Commands, json: bool, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
     match command {
         Commands::Scale { service, replicas } => {
             rt.block_on(scale::scale_service(&service, replicas))
@@ -433,6 +439,7 @@ fn dispatch(command: Commands, rt: &tokio::runtime::Runtime) -> anyhow::Result<(
             since.as_deref(),
             tail,
             grep.as_deref(),
+            json,
         )),
         Commands::Exec { service, tty, cmd } => {
             rt.block_on(exec::exec_in_service(&service, &cmd, tty))
@@ -454,9 +461,9 @@ fn dispatch(command: Commands, rt: &tokio::runtime::Runtime) -> anyhow::Result<(
         Commands::Cluster { action } => dispatch_cluster(action, rt),
         Commands::Tokens { action } => dispatch_tokens(action, rt),
         Commands::Auth { action } => match action {
-            AuthCommands::Login => rt.block_on(auth::login()),
+            AuthCommands::Login => rt.block_on(auth::login(json)),
             AuthCommands::Logout => auth::logout(),
-            AuthCommands::Whoami => auth::whoami(),
+            AuthCommands::Whoami => auth::whoami(json),
         },
         Commands::Deploy {
             namespace,
@@ -464,10 +471,10 @@ fn dispatch(command: Commands, rt: &tokio::runtime::Runtime) -> anyhow::Result<(
             service,
             env,
         } => rt.block_on(deploy::deploy(&namespace, &project, &service, env)),
-        Commands::Services { namespace } => rt.block_on(services::list_services(namespace)),
+        Commands::Services { namespace } => rt.block_on(services::list_services(namespace, json)),
         Commands::Projects { action } => match action {
-            ProjectsCommands::List => rt.block_on(projects::list_projects()),
-            ProjectsCommands::Get { name } => rt.block_on(projects::get_project(&name)),
+            ProjectsCommands::List => rt.block_on(projects::list_projects(json)),
+            ProjectsCommands::Get { name } => rt.block_on(projects::get_project(&name, json)),
         },
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
