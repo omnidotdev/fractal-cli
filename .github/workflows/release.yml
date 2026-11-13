@@ -7,6 +7,10 @@ name: Release 🏗️
 # home for the whole stack (see the install section of the README). Publishing
 # cross-repo uses the org-wide GH_PAT, since the default GITHUB_TOKEN is scoped
 # to this repo only.
+#
+# This crate has `fractal-operator = { path = "../fractal-operator" }`, so the
+# build checks out fractal-operator as a sibling directory to resolve that path
+# dependency, matching the on-disk monorepo layout.
 
 on:
   push:
@@ -39,7 +43,18 @@ jobs:
             os: macos-latest
             artifact: fractal-darwin-arm64
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout CLI
+        uses: actions/checkout@v4
+        with:
+          path: fractal-cli
+
+      - name: Checkout operator (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: omnidotdev/fractal-operator
+          ref: master
+          token: ${{ secrets.GH_PAT }}
+          path: fractal-operator
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -52,14 +67,16 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build
+        working-directory: fractal-cli
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package binary
+        working-directory: fractal-cli
         run: |
-          cp target/${{ matrix.target }}/release/fractal ${{ matrix.artifact }}
-          chmod +x ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/fractal ../${{ matrix.artifact }}
+          chmod +x ../${{ matrix.artifact }}
 
       - uses: actions/upload-artifact@v4
         with:
