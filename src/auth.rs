@@ -17,7 +17,7 @@ use std::io::{self, Write};
 
 use anyhow::{Context, Result};
 use colored::Colorize;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
@@ -27,6 +27,32 @@ const DEFAULT_AUTH_URL: &str = "https://identity.omni.dev";
 /// can point at a non-prod Gatekeeper.
 fn auth_url() -> String {
     std::env::var("FRACTAL_AUTH_URL").unwrap_or_else(|_| DEFAULT_AUTH_URL.to_string())
+}
+
+/// Bearer token supplied out-of-band via `FRACTAL_AUTH_TOKEN` (CI and
+/// automation). Empty is treated as unset. This is the same override
+/// the API-calling commands resolve first (see `cluster::api_session`),
+/// so when it is present an interactive `fractal auth login` is
+/// unnecessary.
+fn env_token() -> Option<String> {
+    std::env::var("FRACTAL_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+/// Machine-readable identity for `fractal auth whoami --json`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WhoamiInfo {
+    authenticated: bool,
+    /// Where the active credential comes from: `"env"`
+    /// (`FRACTAL_AUTH_TOKEN`) or `"config"` (persisted login).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -48,11 +74,37 @@ struct LoginUser {
 /// Prompt for email + password, exchange them for a bearer at
 /// `/api/auth/sign-in/email`, persist the token.
 ///
+/// When `FRACTAL_AUTH_TOKEN` is set, the interactive prompt is skipped
+/// entirely: the env token already authenticates every command, so
+/// there is nothing to do. This keeps `fractal auth login` safe to call
+/// unattended from CI.
+///
 /// # Errors
 ///
 /// Returns an error if stdin can't be read, the login request fails,
 /// or the config can't be written.
-pub async fn login() -> Result<()> {
+pub async fn login(json: bool) -> Result<()> {
+    if env_token().is_some() {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&WhoamiInfo {
+                    authenticated: true,
+                    source: Some("env"),
+                    email: None,
+                    user_id: None,
+                })?
+            );
+        } else {
+            println!(
+                "{} {} is set; it authenticates every command, so no login is needed",
+                "Already authenticated.".bold(),
+                "FRACTAL_AUTH_TOKEN".cyan(),
+            );
+        }
+        return Ok(());
+    }
+
     let base = auth_url();
     let email = prompt("Email: ")?;
     let password = rpassword::prompt_password("Password: ").context("failed to read password")?;
@@ -91,14 +143,24 @@ pub async fn login() -> Result<()> {
     let mut cfg = Config::load()?;
     cfg.auth.access_token = Some(token);
     cfg.auth.user_id = user.id;
-    cfg.auth.email = user.email.clone().or_else(|| Some(email.clone()));
+    cfg.auth.email = user.email.or(Some(email));
     cfg.save()?;
 
-    println!(
-        "{} {}",
-        "Logged in as".bold(),
-        user.email.unwrap_or(email).cyan()
-    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&WhoamiInfo {
+                authenticated: true,
+                source: Some("config"),
+                email: cfg.auth.email,
+                user_id: cfg.auth.user_id,
+            })?
+        );
+    } else if let Some(display) = &cfg.auth.email {
+        println!("{} {}", "Logged in as".bold(), display.cyan());
+    } else {
+        println!("{}", "Logged in".bold());
+    }
     Ok(())
 }
 
@@ -123,19 +185,64 @@ pub fn logout() -> Result<()> {
     Ok(())
 }
 
-/// Print the currently logged-in identity (from the stored config,
-/// no network call).
+/// Print the currently logged-in identity. Resolves `FRACTAL_AUTH_TOKEN`
+/// first (the CI/automation override), then the persisted login config.
+/// No network call either way.
 ///
 /// # Errors
 ///
-/// Returns an error if the config can't be loaded.
-pub fn whoami() -> Result<()> {
+/// Returns an error if the config can't be loaded or JSON serialization
+/// fails.
+pub fn whoami(json: bool) -> Result<()> {
     let cfg = Config::load()?;
-    match (cfg.auth.email.as_deref(), cfg.auth.access_token.is_some()) {
-        (Some(email), true) => {
+    let info = if env_token().is_some() {
+        WhoamiInfo {
+            authenticated: true,
+            source: Some("env"),
+            email: cfg.auth.email,
+            user_id: cfg.auth.user_id,
+        }
+    } else if cfg.auth.access_token.is_some() {
+        WhoamiInfo {
+            authenticated: true,
+            source: Some("config"),
+            email: cfg.auth.email,
+            user_id: cfg.auth.user_id,
+        }
+    } else {
+        WhoamiInfo {
+            authenticated: false,
+            source: None,
+            email: None,
+            user_id: None,
+        }
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&info)?);
+        return Ok(());
+    }
+
+    match (info.authenticated, info.source, info.email.as_deref()) {
+        (true, Some("env"), Some(email)) => {
+            println!(
+                "{} {} ({})",
+                "Authenticated as".bold(),
+                email.cyan(),
+                "via FRACTAL_AUTH_TOKEN".dimmed(),
+            );
+        }
+        (true, Some("env"), None) => {
+            println!(
+                "{} {}",
+                "Authenticated".bold(),
+                "via FRACTAL_AUTH_TOKEN".dimmed(),
+            );
+        }
+        (true, _, Some(email)) => {
             println!("{} {}", "Logged in as".bold(), email.cyan());
         }
-        (_, true) => {
+        (true, _, None) => {
             println!("{}", "Logged in (no email on record)".bold());
         }
         _ => {
