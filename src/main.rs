@@ -3,6 +3,7 @@ mod auth;
 mod canary;
 mod cluster;
 mod config;
+mod cron;
 mod db_connect;
 mod deploy;
 mod destroy;
@@ -38,7 +39,7 @@ struct Cli {
     command: Commands,
     /// Emit machine-readable JSON instead of human-formatted output.
     /// Honored by the read commands: `services`, `projects list`/`get`,
-    /// `whoami`, and `logs` (stream metadata plus NDJSON lines).
+    /// `whoami`, `logs` (stream metadata plus NDJSON lines), and `cron`.
     /// Other commands ignore it and keep their human output.
     #[arg(long, global = true)]
     json: bool,
@@ -234,6 +235,12 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectsCommands,
     },
+    /// Control scheduled jobs (cronJob services): list them, run one now,
+    /// pause or resume a schedule, and read runs and their logs
+    Cron {
+        #[command(subcommand)]
+        action: CronCommands,
+    },
     /// Generate shell completion script for the given shell. Pipe to
     /// the shell's completion directory; e.g.:
     ///   fractal completions zsh > ~/.zfunc/_fractal
@@ -285,6 +292,60 @@ enum ProjectsCommands {
     Get {
         /// Project name (`FractalProject` metadata.name)
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CronCommands {
+    /// List scheduled jobs with their schedule, whether they are paused,
+    /// and their last run. `--project` narrows it to one project
+    List,
+    /// Run a scheduled job once now and print the run's Job name
+    Run {
+        /// Scheduled job (cronJob service) name
+        service: String,
+        /// Wait for the run to finish, streaming its logs; exit non-zero
+        /// unless it succeeds
+        #[arg(short, long)]
+        follow: bool,
+        /// With `--follow`, give up after this long: a whole number plus
+        /// a unit, s, m, h, or d (e.g. 30m)
+        #[arg(long, requires = "follow")]
+        timeout: Option<String>,
+    },
+    /// Pause a scheduled job: no scheduled runs start until it is resumed
+    /// (a run in progress finishes, and `cron run` still works)
+    Pause {
+        /// Scheduled job (cronJob service) name
+        service: String,
+    },
+    /// Resume a paused scheduled job
+    Resume {
+        /// Scheduled job (cronJob service) name
+        service: String,
+    },
+    /// List a scheduled job's recent runs, newest first
+    Runs {
+        /// Scheduled job (cronJob service) name
+        service: String,
+        /// Most runs to show (1 to 100)
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=i64::from(cron::MAX_RUNS_LIMIT)))]
+        limit: u32,
+    },
+    /// Show one run's logs, the newest run by default
+    Logs {
+        /// Scheduled job (cronJob service) name
+        service: String,
+        /// Run (Job name) to read, from `cron runs`; defaults to the newest
+        #[arg(long)]
+        job: Option<String>,
+        /// Show only the last N lines per pod
+        #[arg(short, long)]
+        tail: Option<i64>,
+        /// Wait for a running run to finish, streaming its logs; exit
+        /// non-zero unless it succeeds
+        #[arg(short, long, conflicts_with = "tail")]
+        follow: bool,
     },
 }
 
@@ -511,6 +572,10 @@ enum EnvCommands {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Both rustls backends are compiled in, so pick one before any TLS use
+    // (the kube client panics otherwise). Fails only if one is already set
+    let _ = rustls::crypto::ring::default_provider().install_default();
     workspace::set_flag(cli.workspace.clone());
 
     let rt = match tokio::runtime::Runtime::new() {
@@ -665,6 +730,7 @@ fn dispatch(command: Commands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
             }
         }
         Commands::Projects { action } => dispatch_projects(action, ctx),
+        Commands::Cron { action } => dispatch_cron(action, ctx),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let bin_name = cmd.get_name().to_string();
@@ -691,6 +757,37 @@ fn dispatch_logs(service: &str, opts: &logs::LogOptions<'_>, ctx: &Ctx<'_>) -> a
         opts.previous,
         opts.json,
     ))
+}
+
+fn dispatch_cron(action: CronCommands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let project = ctx.project();
+    let via = if ctx.is_api()? {
+        cron::Via::Api {
+            project: project.as_deref(),
+        }
+    } else {
+        cron::Via::Kube
+    };
+    let json = ctx.json;
+    ctx.rt.block_on(async {
+        match action {
+            CronCommands::List => cron::list(via, json).await,
+            CronCommands::Run {
+                service,
+                follow,
+                timeout,
+            } => cron::run(via, &service, follow, timeout.as_deref(), json).await,
+            CronCommands::Pause { service } => cron::set_paused(via, &service, true, json).await,
+            CronCommands::Resume { service } => cron::set_paused(via, &service, false, json).await,
+            CronCommands::Runs { service, limit } => cron::runs(via, &service, limit, json).await,
+            CronCommands::Logs {
+                service,
+                job,
+                tail,
+                follow,
+            } => cron::logs(via, &service, job.as_deref(), tail, follow, json).await,
+        }
+    })
 }
 
 fn dispatch_projects(action: ProjectsCommands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
@@ -1078,9 +1175,111 @@ mod tests {
             vec!["fractal", "tokens", "list"],
             vec!["fractal", "members", "list", "demo"],
             vec!["fractal", "deploy", "--service", "web"],
+            vec!["fractal", "cron", "list"],
+            vec!["fractal", "cron", "run", "nightly"],
+            vec!["fractal", "cron", "logs", "nightly"],
         ] {
             let cli = Cli::try_parse_from(&argv).unwrap();
             assert!(super::hosted_gap(&cli.command).is_none(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn cron_commands_parse() {
+        let cli = Cli::try_parse_from(["fractal", "cron", "list", "--project", "demo"]).unwrap();
+        assert_eq!(cli.project.as_deref(), Some("demo"));
+        assert!(matches!(
+            cli.command,
+            super::Commands::Cron {
+                action: super::CronCommands::List
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "fractal",
+            "cron",
+            "run",
+            "nightly",
+            "--follow",
+            "--timeout",
+            "30m",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Commands::Cron {
+                action: super::CronCommands::Run { ref service, follow: true, ref timeout }
+            } if service == "nightly" && timeout.as_deref() == Some("30m")
+        ));
+        let cli = Cli::try_parse_from(["fractal", "cron", "run", "nightly"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Commands::Cron {
+                action: super::CronCommands::Run {
+                    follow: false,
+                    timeout: None,
+                    ..
+                }
+            }
+        ));
+        for (verb, paused) in [("pause", true), ("resume", false)] {
+            let cli = Cli::try_parse_from(["fractal", "cron", verb, "nightly"]).unwrap();
+            let super::Commands::Cron { action } = cli.command else {
+                panic!("not a cron command");
+            };
+            assert_eq!(
+                matches!(action, super::CronCommands::Pause { .. }),
+                paused,
+                "{verb}"
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "fractal", "--json", "cron", "runs", "nightly", "--limit", "5",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            super::Commands::Cron {
+                action: super::CronCommands::Runs { limit: 5, .. }
+            }
+        ));
+        let cli = Cli::try_parse_from(["fractal", "cron", "runs", "nightly"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Commands::Cron {
+                action: super::CronCommands::Runs { limit: 20, .. }
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "fractal",
+            "cron",
+            "logs",
+            "nightly",
+            "--job",
+            "nightly-manual-abc",
+            "-f",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Commands::Cron {
+                action: super::CronCommands::Logs { ref job, follow: true, tail: None, .. }
+            } if job.as_deref() == Some("nightly-manual-abc")
+        ));
+    }
+
+    #[test]
+    fn cron_rejects_bad_arguments() {
+        for argv in [
+            vec!["fractal", "cron", "runs", "nightly", "--limit", "0"],
+            vec!["fractal", "cron", "runs", "nightly", "--limit", "101"],
+            vec!["fractal", "cron", "run", "nightly", "--timeout", "5m"],
+            vec![
+                "fractal", "cron", "logs", "nightly", "--follow", "--tail", "5",
+            ],
+            vec!["fractal", "cron", "run"],
+        ] {
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
         }
     }
 

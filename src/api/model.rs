@@ -29,6 +29,7 @@ const SERVICE_FIELDS: &str = r"
     deploy {
       replicas
       schedule
+      cron { suspend timeZone concurrencyPolicy }
       env {
         name
         value
@@ -264,8 +265,21 @@ pub struct Build {
 pub struct Deploy {
     #[serde(default)]
     pub schedule: Option<String>,
+    /// Scheduled-job controls (`deploy.cron`), set on `cronJob` services
+    #[serde(default)]
+    pub cron: Option<CronSpec>,
     #[serde(default, deserialize_with = "null_default")]
     pub env: Vec<EnvVar>,
+}
+
+/// The `deploy.cron` controls the CLI reads
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronSpec {
+    #[serde(default)]
+    pub suspend: Option<bool>,
+    #[serde(default)]
+    pub time_zone: Option<String>,
 }
 
 /// An env var as read from, and written back to, the API. Plaintext
@@ -457,7 +471,7 @@ pub mod fixtures {
        "spec":{"project":"demo","serviceType":"cronJob",
          "source":{"__typename":"FractalServiceSourceImage","repository":"reg/nightly","tag":"v1"},
          "build":{"mode":"none","rootDir":null,"watchPaths":null},
-         "deploy":{"replicas":null,"schedule":"0 3 * * *","env":[]}},
+         "deploy":{"replicas":null,"schedule":"0 3 * * *","cron":{"suspend":true,"timeZone":"America/Chicago","concurrencyPolicy":"forbid"},"env":[]}},
        "status":null}
     ]}}"#;
 }
@@ -488,6 +502,10 @@ mod tests {
             cron.spec.deploy.as_ref().unwrap().schedule.as_deref(),
             Some("0 3 * * *")
         );
+        let controls = cron.spec.deploy.as_ref().unwrap().cron.as_ref().unwrap();
+        assert_eq!(controls.suspend, Some(true));
+        assert_eq!(controls.time_zone.as_deref(), Some("America/Chicago"));
+        assert!(web.spec.deploy.as_ref().unwrap().cron.is_none());
     }
 
     #[test]
@@ -600,6 +618,7 @@ mod tests {
     fn documents_reference_expected_operations() {
         assert!(list_services_query().contains("fractalServices(project: $project)"));
         assert!(list_services_query().contains("rootDir watchPaths"));
+        assert!(list_services_query().contains("cron { suspend timeZone"));
         assert!(get_service_query().contains("fractalService(project: $project, name: $name)"));
         assert!(update_service_mutation().contains("updateFractalService(input: $input)"));
         assert!(list_projects_query().contains("fractalProjects"));

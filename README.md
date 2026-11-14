@@ -106,7 +106,7 @@ A service is addressed by name. When two projects have a service with the same n
 
 | Over the API | Not available yet on hosted workspaces |
 | --- | --- |
-| `services`, `projects list`/`get`, `logs` (incl. `--follow`), `deploy`, `env list`/`set`/`set-secret`/`unset`, `scale`, `tokens list`/`create`/`revoke`, `members list`/`add`/`remove`, `workspace list`/`use`/`current`, `login`/`whoami`/`logout` | `exec` (use the Shell tab in the dashboard), `restart` (use `fractal deploy`), `rollback`, `destroy`, `restore`, `canary` (use the service's page in the dashboard), `db-connect` (copy the connection string from the dashboard), `port-forward`, `secrets-sync`, `tokens delete` (use `tokens revoke`) |
+| `services`, `projects list`/`get`, `logs` (incl. `--follow`), `deploy`, `cron list`/`run`/`pause`/`resume`/`runs`/`logs`, `env list`/`set`/`set-secret`/`unset`, `scale`, `tokens list`/`create`/`revoke`, `members list`/`add`/`remove`, `workspace list`/`use`/`current`, `login`/`whoami`/`logout` | `exec` (use the Shell tab in the dashboard), `restart` (use `fractal deploy`), `rollback`, `destroy`, `restore`, `canary` (use the service's page in the dashboard), `db-connect` (copy the connection string from the dashboard), `port-forward`, `secrets-sync`, `tokens delete` (use `tokens revoke`) |
 
 The unavailable commands exit immediately with a short message saying what to use instead.
 
@@ -133,7 +133,23 @@ fractal services
 fractal logs my-service --follow
 ```
 
-Run `fractal --help` (or `fractal <command> --help`) for the full command list, which includes `scale`, `restart`, `rollback`, `destroy`/`restore`, `env`, `logs`, `exec`, `port-forward`, `db-connect`, `secrets-sync`, `members`, `projects`, `services`, `deploy`, `canary`, `tokens`, `cluster`, and shell `completions`.
+Run `fractal --help` (or `fractal <command> --help`) for the full command list, which includes `scale`, `restart`, `rollback`, `destroy`/`restore`, `env`, `logs`, `cron`, `exec`, `port-forward`, `db-connect`, `secrets-sync`, `members`, `projects`, `services`, `deploy`, `canary`, `tokens`, `cluster`, and shell `completions`.
+
+## Scheduled jobs (`fractal cron`)
+
+`fractal cron` controls existing scheduled jobs (`serviceType: cronJob` services) on both transports:
+
+```sh
+fractal cron list                        # every job: schedule, paused or active, last run (--project narrows it)
+fractal cron run my-job                  # run once now; prints the run's Job name
+fractal cron run my-job --follow         # also wait, stream its logs, and exit non-zero unless it succeeds
+fractal cron pause my-job                # stop the schedule (a run in progress finishes)
+fractal cron resume my-job
+fractal cron runs my-job --limit 5       # recent runs, newest first (1 to 100, default 20)
+fractal cron logs my-job                 # the newest run's logs; --job <name> picks a run, --follow waits for it
+```
+
+`cron run --follow` (optionally with `--timeout 30m`) makes a job a CI step that fails when the job fails. A run is requested from the operator through the `fractal.omni.dev/run-now` annotation, on either transport, so the CLI never creates Jobs and the run's name is known before it starts; a request the operator cannot start within 10 minutes is dropped, and `--follow` reports that. `run`, `pause`, and `resume` need the `developer` role or higher; `list`, `runs`, and `logs` work with any project role. On `kube`, the commands act on the jobs in the current kubeconfig namespace.
 
 ## Transports
 
@@ -156,11 +172,14 @@ fractal --json projects list            # JSON array of projects
 fractal --json projects get my-project  # JSON object for one project
 fractal --json whoami                   # { authenticated, source, kind, email, workspace, ... }
 fractal --json logs my-service          # stream metadata line, then NDJSON log lines
+fractal --json cron list                # [{ project, name, schedule, timeZone, suspended, lastRun }]
+fractal --json cron runs my-job         # [{ name, manual, status, startTime, completionTime, durationSeconds }]
+fractal --json cron run my-job          # { service, job, follow }; with --follow, NDJSON log lines then the finished run
 ```
 
 The `services` JSON rows surface a few fields the human table omits, so CI can discover a service's shape without cluster access to the raw `FractalService`: `serviceType` (`web`, `worker`, `cronJob`, `staticSite`, `database`), the monorepo build subdir `rootDir`, the webhook `watchPaths`, and the cron `schedule`. Commands without a `--json` implementation keep their human output.
 
-> The CLI reads and operates existing services (including monorepo and cron ones); it does not create them. Declare a new service's `serviceType: cronJob` + `schedule`, or its monorepo `rootDir`/`watchPaths`, in a repo-committed `fractal.yaml` or through the dashboard, then deploy it. The read commands above then expose those fields for scripting.
+> The CLI reads and operates existing services (including monorepo and cron ones: see `fractal cron`); it does not create them. Declare a new service's `serviceType: cronJob` + `schedule`, or its monorepo `rootDir`/`watchPaths`, in a repo-committed `fractal.yaml` or through the dashboard, then deploy it. The read commands above then expose those fields for scripting.
 
 ## Authentication
 
