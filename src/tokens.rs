@@ -276,15 +276,20 @@ fn is_expired(expires_at: Option<&String>) -> bool {
 pub const DEFAULT_SUBJECT: &str = "service-account";
 
 /// Pick the workspace for token commands: `--workspace`, then
-/// `FRACTAL_WORKSPACE`, then the single workspace that owns every
-/// project you can see
+/// `FRACTAL_WORKSPACE`, then your only workspace per the browser
+/// login's organizations claim, then the single workspace that owns
+/// every project you can see
 fn infer_workspace(
     explicit: Option<&str>,
     env: Option<&str>,
+    token_workspaces: &[String],
     projects: &[Project],
 ) -> Result<String> {
     if let Some(w) = explicit.or(env).map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(w.to_string());
+    }
+    if let [one] = token_workspaces {
+        return Ok(one.clone());
     }
     let mut ids: Vec<&str> = projects
         .iter()
@@ -295,6 +300,10 @@ fn infer_workspace(
     ids.dedup();
     match ids.as_slice() {
         [one] => Ok((*one).to_string()),
+        [] if token_workspaces.len() > 1 => anyhow::bail!(
+            "you belong to more than one workspace ({}); pass --workspace <id>",
+            token_workspaces.join(", ")
+        ),
         [] => anyhow::bail!(
             "couldn't determine your workspace from your projects; pass --workspace <id>"
         ),
@@ -308,10 +317,14 @@ fn infer_workspace(
 async fn resolve_workspace(client: &api::ApiClient, explicit: Option<&str>) -> Result<String> {
     let env = std::env::var("FRACTAL_WORKSPACE").ok();
     if explicit.is_some() || env.as_deref().is_some_and(|e| !e.trim().is_empty()) {
-        return infer_workspace(explicit, env.as_deref(), &[]);
+        return infer_workspace(explicit, env.as_deref(), &[], &[]);
+    }
+    let from_token = client.token_workspace_ids().await;
+    if from_token.len() == 1 {
+        return infer_workspace(None, None, &from_token, &[]);
     }
     let projects = api::resolve::list_projects(client).await?;
-    infer_workspace(None, None, &projects)
+    infer_workspace(None, None, &from_token, &projects)
 }
 
 /// Status label for a token read from the API
@@ -546,26 +559,61 @@ mod tests {
 
     #[test]
     fn workspace_flag_then_env_then_inference() {
+        let token = ["org_t".to_string()];
         assert_eq!(
-            infer_workspace(Some("org_f"), Some("org_e"), &[]).unwrap(),
+            infer_workspace(Some("org_f"), Some("org_e"), &token, &[]).unwrap(),
             "org_f"
         );
-        assert_eq!(infer_workspace(None, Some("org_e"), &[]).unwrap(), "org_e");
+        assert_eq!(
+            infer_workspace(None, Some("org_e"), &token, &[]).unwrap(),
+            "org_e"
+        );
         let projects = [
             project_in(Some("org_1")),
             project_in(Some("org_1")),
             project_in(None),
         ];
-        assert_eq!(infer_workspace(None, None, &projects).unwrap(), "org_1");
+        assert_eq!(
+            infer_workspace(None, None, &[], &projects).unwrap(),
+            "org_1"
+        );
+    }
+
+    #[test]
+    fn a_single_workspace_in_the_login_claims_wins_over_projects() {
+        let token = ["org_t".to_string()];
+        let projects = [project_in(Some("a")), project_in(Some("b"))];
+        assert_eq!(
+            infer_workspace(None, None, &token, &projects).unwrap(),
+            "org_t"
+        );
+    }
+
+    #[test]
+    fn several_login_workspaces_fall_back_to_projects_then_list_them() {
+        let token = ["org_a".to_string(), "org_b".to_string()];
+        assert_eq!(
+            infer_workspace(None, None, &token, &[project_in(Some("org_b"))]).unwrap(),
+            "org_b"
+        );
+        let err = infer_workspace(None, None, &token, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("(org_a, org_b)") && err.contains("--workspace"));
     }
 
     #[test]
     fn workspace_inference_fails_when_ambiguous_or_empty() {
-        let err = infer_workspace(None, None, &[project_in(Some("a")), project_in(Some("b"))])
-            .unwrap_err()
-            .to_string();
+        let err = infer_workspace(
+            None,
+            None,
+            &[],
+            &[project_in(Some("a")), project_in(Some("b"))],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("(a, b)") && err.contains("--workspace"));
-        let err = infer_workspace(None, None, &[project_in(None)])
+        let err = infer_workspace(None, None, &[], &[project_in(None)])
             .unwrap_err()
             .to_string();
         assert!(err.contains("--workspace"));
