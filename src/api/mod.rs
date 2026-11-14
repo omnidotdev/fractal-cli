@@ -3,7 +3,9 @@
 //! tokens; REST endpoints under `/v1` cover deploys, logs, and project
 //! members. Every request carries the caller's bearer token, either a
 //! Fractal API token (`ftk_...`) or the access token from `fractal
-//! login`, which is refreshed silently before it expires.
+//! login`, which is refreshed silently before it expires. A browser
+//! login also sends the selected workspace as `X-Fractal-Workspace` (see
+//! [`crate::workspace`]); an API token never does.
 
 pub mod model;
 pub mod resolve;
@@ -18,7 +20,8 @@ use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
 use crate::config::{AuthConfig, Config, config_path};
-use crate::oauth::{self, TokenSet};
+use crate::oauth::{self, TokenSet, Workspace};
+use crate::workspace::{self, Offline, Requested, WORKSPACE_HEADER};
 
 /// Production API base URL
 pub const DEFAULT_API_URL: &str = "https://api.fractal.omni.dev";
@@ -145,6 +148,39 @@ pub fn refreshable(cred: &Credential, auth: &AuthConfig) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether requests should carry the `X-Fractal-Workspace` header: only
+/// for a browser login's JWT. An API token (`ftk_...`) is bound to its
+/// workspaces when it is created, and the API ignores the header for
+/// one, so it is never sent; neither is it for a token from the
+/// environment, which is not a browser login.
+pub fn sends_workspace_header(cred: &Credential, auth: &AuthConfig) -> bool {
+    cred.source == CredentialSource::Config && auth.is_oauth() && !cred.token.starts_with("ftk_")
+}
+
+/// Workspace ids in a JWT's organizations claim. Empty for anything
+/// that isn't a JWT.
+fn workspace_ids_in(token: &str) -> Vec<String> {
+    oauth::decode_jwt_claims(token)
+        .map(|claims| {
+            oauth::workspaces(&claims)
+                .into_iter()
+                .map(|w| w.id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The workspace a client acts in, resolved to an id on first use
+#[derive(Default)]
+struct WorkspaceScope {
+    requested: Option<Requested>,
+    /// Send the header (browser login only)
+    send_header: bool,
+    /// The saved workspace, for resolving its slug without a lookup
+    saved: Option<Workspace>,
+    resolved: tokio::sync::OnceCell<Option<String>>,
+}
+
 /// How to refresh a browser-login credential, and where to save the
 /// new tokens
 pub struct Session {
@@ -222,6 +258,7 @@ pub struct ApiClient {
     http: reqwest::Client,
     bearer: Mutex<Bearer>,
     session: Option<Session>,
+    workspace: WorkspaceScope,
 }
 
 impl ApiClient {
@@ -237,7 +274,17 @@ impl ApiClient {
             .and_then(|p| Config::load_from(p).ok())
             .unwrap_or_default();
         let cred = credential_from(&cfg).context(NOT_AUTHENTICATED)?;
-        let client = Self::new(&api_url(), &cred.token)?;
+        let browser = sends_workspace_header(&cred, &cfg.auth);
+        let memberships = if browser {
+            workspace_ids_in(&cred.token)
+        } else {
+            Vec::new()
+        };
+        let client = Self::new(&api_url(), &cred.token)?.with_workspace(
+            workspace::requested(&cfg, browser, &memberships),
+            browser,
+            cfg.workspace.clone().filter(|_| browser),
+        );
         Ok(match refreshable(&cred, &cfg.auth) {
             Some(refresh) => client.with_session(
                 refresh,
@@ -268,7 +315,82 @@ impl ApiClient {
                 expires_at: None,
             }),
             session: None,
+            workspace: WorkspaceScope::default(),
         })
+    }
+
+    /// Set the workspace the client acts in. `send_header` is true only
+    /// for a browser login (see [`sends_workspace_header`]).
+    pub fn with_workspace(
+        mut self,
+        requested: Option<Requested>,
+        send_header: bool,
+        saved: Option<Workspace>,
+    ) -> Self {
+        self.workspace = WorkspaceScope {
+            requested,
+            send_header,
+            saved,
+            resolved: tokio::sync::OnceCell::new(),
+        };
+        self
+    }
+
+    /// The id of the workspace the client acts in, resolved once. A
+    /// browser login resolves a slug through its memberships; for an API
+    /// token the flag or env value is used as given, since it isn't sent
+    /// as a header and only names the workspace for token commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a requested slug or id isn't one of the
+    /// login's workspaces, or the memberships can't be fetched.
+    pub async fn workspace_id(&self) -> Result<Option<String>> {
+        self.workspace
+            .resolved
+            .get_or_try_init(|| self.resolve_workspace())
+            .await
+            .cloned()
+    }
+
+    async fn resolve_workspace(&self) -> Result<Option<String>> {
+        let scope = &self.workspace;
+        let Some(req) = &scope.requested else {
+            return Ok(None);
+        };
+        if !scope.send_header {
+            return Ok(Some(req.value.clone()));
+        }
+        let token = self.bearer_token().await?;
+        match workspace::resolve_offline(req, &workspace_ids_in(&token), scope.saved.as_ref()) {
+            Offline::Id(id) => Ok(Some(id)),
+            Offline::Stale => {
+                eprintln!(
+                    "{} the saved workspace is no longer one of yours; run `fractal workspace use <slug>` to pick another",
+                    colored::Colorize::yellow("Note:")
+                );
+                Ok(None)
+            }
+            Offline::NeedsLookup => {
+                let all = workspace::fetch_memberships(&token).await?;
+                workspace::find(&req.value, &all)
+                    .map(|w| Some(w.id.clone()))
+                    .ok_or_else(|| workspace::not_a_member(&req.value))
+            }
+        }
+    }
+
+    /// The `X-Fractal-Workspace` value to send, if any: the resolved
+    /// workspace, for a browser login only
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::workspace_id`].
+    pub async fn workspace_header(&self) -> Result<Option<String>> {
+        if !self.workspace.send_header {
+            return Ok(None);
+        }
+        self.workspace_id().await
     }
 
     /// Make the credential refreshable
@@ -309,14 +431,7 @@ impl ApiClient {
     /// for an API token, which isn't a JWT.
     pub async fn token_workspace_ids(&self) -> Vec<String> {
         let bearer = self.bearer.lock().await;
-        oauth::decode_jwt_claims(&bearer.access)
-            .map(|claims| {
-                oauth::workspaces(&claims)
-                    .into_iter()
-                    .map(|w| w.id)
-                    .collect()
-            })
-            .unwrap_or_default()
+        workspace_ids_in(&bearer.access)
     }
 
     /// After the API rejected `rejected`, refresh once. Returns the
@@ -346,17 +461,19 @@ impl ApiClient {
         Ok(())
     }
 
-    /// Send a request with the current bearer. On a 401 from a
-    /// refreshable credential, refresh once and retry once.
+    /// Send a request with the current bearer and workspace header. On
+    /// a 401 from a refreshable credential, refresh once and retry once.
     async fn execute<F>(&self, build: F) -> Result<(u16, String)>
     where
-        F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+        F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder + Send + Sync,
     {
         let token = self.bearer_token().await?;
-        let (status, body) = dispatch(build(&self.http, &token)).await?;
+        let ws = self.workspace_header().await?;
+        let request = |token: &str| with_workspace_header(build(&self.http, token), ws.as_deref());
+        let (status, body) = dispatch(request(&token)).await?;
         if is_unauthorized(status, &body) {
             if let Some(fresh) = self.refresh_after_rejection(&token).await? {
-                return dispatch(build(&self.http, &fresh)).await;
+                return dispatch(request(&fresh)).await;
             }
         }
         Ok((status, body))
@@ -421,6 +538,17 @@ impl ApiClient {
     }
 }
 
+/// Attach the `X-Fractal-Workspace` header when a workspace is selected
+pub fn with_workspace_header(
+    req: reqwest::RequestBuilder,
+    workspace: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match workspace {
+        Some(id) => req.header(WORKSPACE_HEADER, id),
+        None => req,
+    }
+}
+
 async fn dispatch(req: reqwest::RequestBuilder) -> Result<(u16, String)> {
     let resp = req.send().await.map_err(|e| unreachable_error(&e))?;
     let status = resp.status().as_u16();
@@ -475,9 +603,19 @@ fn error_message(body: &str) -> Option<String> {
     Some(trimmed.chars().take(300).collect())
 }
 
+/// The API's reason when the selected workspace isn't one of the
+/// caller's
+const WORKSPACE_DENIED: &str = "workspace access denied";
+
+/// Shown when the API refuses the selected workspace
+const WORKSPACE_DENIED_HINT: &str = "the selected workspace isn't one of yours; run `fractal workspace list` and `fractal workspace use <slug>`";
+
 /// Turn a non-2xx response into a user-facing error
 fn http_error(status: u16, body: &str) -> anyhow::Error {
     let msg = error_message(body);
+    if status == 403 && msg.as_deref() == Some(WORKSPACE_DENIED) {
+        return anyhow::anyhow!(WORKSPACE_DENIED_HINT);
+    }
     match status {
         401 => anyhow::anyhow!(REJECTED),
         403 => anyhow::anyhow!(
@@ -560,6 +698,13 @@ pub fn parse_graphql<T: DeserializeOwned>(status: u16, body: &str) -> Result<T> 
             .any(|e| e.code() == Some("UNAUTHENTICATED"))
         {
             anyhow::bail!(REJECTED);
+        }
+        if envelope
+            .errors
+            .iter()
+            .any(|e| e.message == WORKSPACE_DENIED)
+        {
+            anyhow::bail!(WORKSPACE_DENIED_HINT);
         }
         let joined = envelope
             .errors
@@ -1033,5 +1178,135 @@ mod tests {
             403,
             r#"{"error":"UNAUTHENTICATED is a word"}"#
         ));
+    }
+
+    /// An unsigned JWT whose organizations claim lists `orgs`
+    fn fake_jwt(orgs: &[&str]) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let entries: Vec<_> = orgs
+            .iter()
+            .map(|id| serde_json::json!({ "id": id }))
+            .collect();
+        let payload = serde_json::json!({ "sub": "u1", oauth::ORGANIZATIONS_CLAIM: entries });
+        format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA"}"#),
+            URL_SAFE_NO_PAD.encode(payload.to_string())
+        )
+    }
+
+    fn selected(value: &str, source: workspace::Source) -> Requested {
+        Requested {
+            value: value.to_string(),
+            source,
+        }
+    }
+
+    #[test]
+    fn only_a_browser_login_jwt_sends_the_workspace_header() {
+        let oauth_auth = AuthConfig {
+            kind: Some(crate::config::TokenKind::Oauth),
+            ..AuthConfig::default()
+        };
+        let api_auth = AuthConfig {
+            kind: Some(crate::config::TokenKind::ApiToken),
+            ..AuthConfig::default()
+        };
+        let saved = |token: &str| Credential {
+            token: token.to_string(),
+            source: CredentialSource::Config,
+        };
+        assert!(sends_workspace_header(&saved("eyJ.x.y"), &oauth_auth));
+        assert!(!sends_workspace_header(&saved("ftk_abc"), &oauth_auth));
+        assert!(!sends_workspace_header(&saved("ftk_abc"), &api_auth));
+        assert!(!sends_workspace_header(
+            &saved("eyJ.x.y"),
+            &AuthConfig::default()
+        ));
+        let env = Credential {
+            token: "eyJ.x.y".to_string(),
+            source: CredentialSource::ApiTokenEnv,
+        };
+        assert!(!sends_workspace_header(&env, &oauth_auth));
+    }
+
+    #[tokio::test]
+    async fn a_browser_login_sends_the_workspace_header_on_graphql_and_rest() {
+        let token = fake_jwt(&["org_a", "org_b"]);
+        let (base, rx) = test_server::serve(200, r#"{"data":{"ok":true}}"#).await;
+        let client = ApiClient::new(&base, &token).unwrap().with_workspace(
+            Some(selected("org_b", workspace::Source::Env)),
+            true,
+            None,
+        );
+        let _: Data = client
+            .graphql("query { ok }", serde_json::json!({}))
+            .await
+            .unwrap();
+        let req = rx.await.unwrap().to_ascii_lowercase();
+        assert!(req.contains("x-fractal-workspace: org_b"), "{req}");
+
+        let (base, rx) = test_server::serve(200, r#"{"ok":true}"#).await;
+        let saved = Workspace {
+            id: "org_a".to_string(),
+            name: Some("Alpha".to_string()),
+            slug: Some("alpha".to_string()),
+        };
+        let client = ApiClient::new(&base, &token).unwrap().with_workspace(
+            Some(selected("alpha", workspace::Source::Flag)),
+            true,
+            Some(saved),
+        );
+        let _: Data = client.get("/v1/projects", &[]).await.unwrap();
+        let req = rx.await.unwrap().to_ascii_lowercase();
+        assert!(req.contains("x-fractal-workspace: org_a"), "{req}");
+    }
+
+    #[tokio::test]
+    async fn an_api_token_never_sends_the_workspace_header() {
+        let (base, rx) = test_server::serve(200, r#"{"data":{"ok":true}}"#).await;
+        let client = ApiClient::new(&base, "ftk_test").unwrap().with_workspace(
+            Some(selected("org_b", workspace::Source::Flag)),
+            false,
+            None,
+        );
+        let _: Data = client
+            .graphql("query { ok }", serde_json::json!({}))
+            .await
+            .unwrap();
+        let req = rx.await.unwrap().to_ascii_lowercase();
+        assert!(!req.contains("x-fractal-workspace"), "{req}");
+        // Token commands still get the flag value as the workspace id
+        assert_eq!(
+            client.workspace_id().await.unwrap().as_deref(),
+            Some("org_b")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_selection_sends_no_header() {
+        let (base, rx) = test_server::serve(200, r#"{"ok":true}"#).await;
+        let client = ApiClient::new(&base, &fake_jwt(&["org_a", "org_b"]))
+            .unwrap()
+            .with_workspace(None, true, None);
+        let _: Data = client.get("/v1/projects", &[]).await.unwrap();
+        let req = rx.await.unwrap().to_ascii_lowercase();
+        assert!(!req.contains("x-fractal-workspace"), "{req}");
+    }
+
+    #[test]
+    fn a_refused_workspace_explains_how_to_pick_another() {
+        let rest = http_error(403, r#"{"error":"workspace access denied"}"#).to_string();
+        assert!(rest.contains("fractal workspace use"), "{rest}");
+        let other = http_error(403, r#"{"error":"not a member of this project"}"#).to_string();
+        assert_eq!(other, "permission denied: not a member of this project");
+        let gql = parse_graphql::<Data>(
+            403,
+            r#"{"errors":[{"message":"workspace access denied","extensions":{"code":"FORBIDDEN"}}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(gql.contains("fractal workspace use"), "{gql}");
     }
 }
