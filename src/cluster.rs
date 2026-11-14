@@ -13,29 +13,12 @@ use kube::{Api, Client, Config};
 /// install command for users on the OSS path.
 const DEFAULT_BUNDLE_URL: &str = "https://fractal.omni.dev/install/operator.yaml";
 
-/// Public base URL of the Fractal API. Used to mint per-cluster install
-/// tokens against `POST /v1/clusters/install-tokens`. Defaults to
-/// production; override with `FRACTAL_API_URL` to point at a dev API.
-const DEFAULT_API_URL: &str = "https://api.fractal.omni.dev";
-
-fn api_url() -> String {
-    std::env::var("FRACTAL_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string())
-}
-
-/// Gatekeeper-issued bearer token used to authenticate the mint call.
-/// Lookup order:
-///   1. `FRACTAL_AUTH_TOKEN` env var (CI/automation override).
-///   2. `~/.config/fractal/config.toml` populated by
-///      `fractal auth login`.
+/// Gatekeeper-issued bearer token or Fractal API token used to
+/// authenticate the mint call. Resolved by `crate::api::credential()`:
+/// `FRACTAL_API_TOKEN`, then `FRACTAL_AUTH_TOKEN`, then the token saved
+/// by `fractal auth login`.
 fn auth_token() -> Option<String> {
-    if let Ok(env) = std::env::var("FRACTAL_AUTH_TOKEN") {
-        if !env.is_empty() {
-            return Some(env);
-        }
-    }
-    crate::config::Config::load()
-        .ok()
-        .and_then(|c| c.auth.access_token)
+    crate::api::credential().map(|c| c.token)
 }
 
 /// Shape of `POST /v1/clusters/install-tokens` request body. Currently
@@ -76,13 +59,11 @@ struct ListedInstallTokensResponse {
     tokens: Vec<ListedInstallToken>,
 }
 
-/// Shared helper: build a reqwest client + resolve API URL + token.
-/// Public so sibling commands (deploy, etc) can reuse the same auth
-/// resolution.
-pub fn api_session() -> Result<(String, String, reqwest::Client)> {
-    let base = api_url();
-    let token = auth_token()
-        .context("Not authenticated. Run `fractal auth login` (or set FRACTAL_AUTH_TOKEN).")?;
+/// Build a reqwest client and resolve the API URL + token, using the
+/// same precedence as every other API-backed command
+fn api_session() -> Result<(String, String, reqwest::Client)> {
+    let base = crate::api::api_url();
+    let token = auth_token().context(crate::api::NOT_AUTHENTICATED)?;
     let client = reqwest::Client::builder()
         .build()
         .context("failed to build HTTP client")?;
@@ -435,6 +416,10 @@ pub async fn connect(
     println!("{} {}", "Context:".bold(), active_ctx.cyan());
     println!("{} {}", "Apiserver:".bold(), server.cyan());
 
+    // A BYOC machine keeps talking to its own cluster even after an API
+    // login; `--transport` / `FRACTAL_TRANSPORT` still override this
+    persist_kube_transport();
+
     match node_list {
         Ok(list) => {
             let count = list.items.len();
@@ -489,6 +474,30 @@ pub async fn connect(
     );
 
     Ok(())
+}
+
+/// Record `transport = "kube"` in the CLI config. Failure is a warning:
+/// connecting the cluster matters more than remembering the preference.
+fn persist_kube_transport() {
+    let result = crate::config::Config::load().and_then(|mut cfg| {
+        if cfg.transport.as_deref() == Some("kube") {
+            return Ok(false);
+        }
+        cfg.transport = Some("kube".to_string());
+        cfg.save().map(|()| true)
+    });
+    match result {
+        Ok(true) => println!(
+            "{} {}",
+            "Transport:".bold(),
+            "kube (saved; override with --transport or FRACTAL_TRANSPORT)".dimmed()
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!(
+            "{} could not save transport preference: {e}",
+            "warning:".yellow()
+        ),
+    }
 }
 
 /// Inspect cluster install state.

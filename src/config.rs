@@ -1,9 +1,9 @@
 //! Persistent CLI configuration. Stored at
 //! `$XDG_CONFIG_HOME/fractal/config.toml` (or
-//! `~/.config/fractal/config.toml`). Currently holds only the bearer
-//! token from `fractal auth login`; other state lives elsewhere
-//! (kubeconfig on disk for cluster connectivity, env vars for the API
-//! endpoint).
+//! `~/.config/fractal/config.toml`). Holds the bearer token from
+//! `fractal auth login`, the preferred transport (`api` or `kube`), and
+//! an optional API base URL. Kubeconfig stays on disk where kubectl
+//! keeps it.
 
 use std::fs;
 use std::path::PathBuf;
@@ -13,6 +13,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
+    /// Preferred transport (`api` or `kube`). Written as `kube` by
+    /// `fractal cluster connect` so BYOC users who also log in keep
+    /// talking to their own cluster. Flag and env var override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// Fractal API base URL. `FRACTAL_API_URL` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
     #[serde(default)]
     pub auth: AuthConfig,
 }
@@ -80,5 +88,31 @@ impl Config {
             fs::set_permissions(&path, perms)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn parses_legacy_config_without_new_fields() {
+        let cfg: Config = toml::from_str("[auth]\naccess_token = \"abc\"\n").unwrap();
+        assert_eq!(cfg.auth.access_token.as_deref(), Some("abc"));
+        assert!(cfg.transport.is_none());
+        assert!(cfg.api_url.is_none());
+    }
+
+    #[test]
+    fn round_trips_transport_and_api_url() {
+        let cfg = Config {
+            transport: Some("kube".to_string()),
+            api_url: Some("https://api.example.test".to_string()),
+            ..Config::default()
+        };
+        let out = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&out).unwrap();
+        assert_eq!(back.transport.as_deref(), Some("kube"));
+        assert_eq!(back.api_url.as_deref(), Some("https://api.example.test"));
     }
 }

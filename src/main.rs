@@ -1,3 +1,4 @@
+mod api;
 mod auth;
 mod canary;
 mod cluster;
@@ -18,11 +19,14 @@ mod scale;
 mod secrets_sync;
 mod services;
 mod tokens;
+mod transport;
 
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
+
+use transport::{Transport, unavailable};
 
 /// Fractal - deploy applications to Kubernetes
 #[derive(Parser)]
@@ -36,6 +40,40 @@ struct Cli {
     /// Other commands ignore it and keep their human output.
     #[arg(long, global = true)]
     json: bool,
+    /// How to reach Fractal: `api` (hosted, bearer token) or `kube`
+    /// (BYOC/admin, kubeconfig). Overrides `FRACTAL_TRANSPORT` and the
+    /// saved config. Defaults to `api` when a token is configured.
+    #[arg(long, global = true, value_enum)]
+    transport: Option<Transport>,
+    /// Project (name or slug) that owns the service, for the api
+    /// transport. Falls back to `FRACTAL_PROJECT`; when neither is set,
+    /// the service is looked up across your projects.
+    #[arg(long, global = true)]
+    project: Option<String>,
+}
+
+/// Global options every dispatcher needs
+struct Ctx<'a> {
+    json: bool,
+    transport: Option<Transport>,
+    project: Option<String>,
+    rt: &'a tokio::runtime::Runtime,
+}
+
+impl Ctx<'_> {
+    /// Resolve the transport lazily, so commands that don't need it
+    /// (completions, auth login) never read config they don't use
+    fn transport(&self) -> anyhow::Result<Transport> {
+        transport::resolve(self.transport)
+    }
+
+    fn is_api(&self) -> anyhow::Result<bool> {
+        Ok(self.transport()? == Transport::Api)
+    }
+
+    fn project(&self) -> Option<String> {
+        api::resolve::project_hint(self.project.as_deref())
+    }
 }
 
 #[derive(Subcommand)]
@@ -89,6 +127,12 @@ enum Commands {
         /// Filter lines containing this substring
         #[arg(short, long)]
         grep: Option<String>,
+        /// Prefix each line with its timestamp (the kube transport always does)
+        #[arg(long)]
+        timestamps: bool,
+        /// Show logs from the previous (crashed) container instance
+        #[arg(long)]
+        previous: bool,
     },
     /// Exec a command in a service's running pod
     Exec {
@@ -173,20 +217,19 @@ enum Commands {
         /// Shell to generate completions for
         shell: Shell,
     },
-    /// Trigger a rebuild on a `FractalService` via fractal-api (CI use).
+    /// Trigger a rebuild on a service via the Fractal API (CI use).
     ///
     /// Unlike `restart`, this goes through the authed HTTP endpoint
-    /// (Gatekeeper JWT + project-developer role) instead of patching
-    /// the K8s Deployment directly, so it works from CI runners that
-    /// don't have cluster RBAC.
+    /// (bearer token + project developer role) instead of patching the
+    /// Deployment directly, so it works from CI runners and hosted
+    /// workspaces with no cluster access. Pass `--project` to skip the
+    /// lookup; `--namespace` is derived when omitted.
     Deploy {
-        /// Namespace the `FractalService` lives in (e.g. fractal-myproject)
+        /// Namespace the service lives in (read from the API when
+        /// omitted; pass `--env` to target an environment)
         #[arg(long)]
-        namespace: String,
-        /// Parent `FractalProject` name (used for RBAC)
-        #[arg(long)]
-        project: String,
-        /// `FractalService` name to rebuild
+        namespace: Option<String>,
+        /// Service name to rebuild
         #[arg(long)]
         service: String,
         /// Optional environment to target (e.g. "production")
@@ -238,9 +281,15 @@ enum CanaryCommands {
 
 #[derive(Subcommand)]
 enum AuthCommands {
-    /// Log in with email + password, persisting a bearer token at
+    /// Save a Fractal API token (`--token`), or log in with email +
+    /// password. Either way the bearer token is persisted at
     /// ~/.config/fractal/config.toml
-    Login,
+    Login {
+        /// Fractal API token (`ftk_...`) to save. Pass `-` to read it
+        /// from stdin so it stays out of shell history
+        #[arg(long)]
+        token: Option<String>,
+    },
     /// Clear the persisted bearer token
     Logout,
     /// Print the currently logged-in identity
@@ -250,7 +299,12 @@ enum AuthCommands {
 #[derive(Subcommand)]
 enum TokensCommands {
     /// List tokens in the current workspace
-    List,
+    List {
+        /// Workspace id (api transport). Falls back to
+        /// `FRACTAL_WORKSPACE`, then the workspace that owns your projects
+        #[arg(long)]
+        workspace: Option<String>,
+    },
     /// Mint a new token. The plaintext is printed once; only its hash is stored.
     Create {
         /// Human-readable label (e.g. "github-actions-ci")
@@ -267,11 +321,19 @@ enum TokensCommands {
         /// Token lifetime in days. Omit for never-expires.
         #[arg(long)]
         expires_in_days: Option<i64>,
+        /// Workspace id (api transport). Falls back to
+        /// `FRACTAL_WORKSPACE`, then the workspace that owns your projects
+        #[arg(long)]
+        workspace: Option<String>,
     },
-    /// Revoke a token (sets spec.revokedAt; CR remains for audit)
+    /// Revoke a token (kept for audit)
     Revoke {
         /// Token label
         name: String,
+        /// Workspace id (api transport). Falls back to
+        /// `FRACTAL_WORKSPACE`, then the workspace that owns your projects
+        #[arg(long)]
+        workspace: Option<String>,
     },
     /// Permanently delete a token CR (audit trail goes with it; prefer revoke)
     Delete {
@@ -374,6 +436,10 @@ enum EnvCommands {
         service: String,
         /// Key=value pair
         pair: String,
+        /// Store the value as a managed secret: it is sent write-only and
+        /// never shown again (api transport)
+        #[arg(long)]
+        secret: bool,
     },
     /// Set an env var from a Kubernetes secret
     SetSecret {
@@ -408,7 +474,13 @@ fn main() -> ExitCode {
         }
     };
 
-    match dispatch(cli.command, cli.json, &rt) {
+    let ctx = Ctx {
+        json: cli.json,
+        transport: cli.transport,
+        project: cli.project,
+        rt: &rt,
+    };
+    match dispatch(cli.command, &ctx) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -417,37 +489,96 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch(command: Commands, json: bool, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+/// Hint for commands that need direct cluster access
+const NEEDS_CLUSTER: &str =
+    "it needs direct cluster access (connect a BYOC cluster and use `--transport kube`)";
+
+/// Hint for service actions the dashboard covers
+const USE_SERVICE_PAGE: &str = "use the service's page in the dashboard";
+
+/// Commands with no hosted equivalent yet, and what to do instead. The
+/// api transport fails fast on these rather than reaching for a
+/// kubeconfig the user doesn't have.
+const fn hosted_gap(command: &Commands) -> Option<(&'static str, &'static str)> {
+    Some(match command {
+        Commands::Restart { .. } => (
+            "restart",
+            "run `fractal deploy --service <name>` to rebuild and roll it out",
+        ),
+        Commands::Rollback { .. } => ("rollback", USE_SERVICE_PAGE),
+        Commands::Destroy { .. } => ("destroy", USE_SERVICE_PAGE),
+        Commands::Restore { .. } => ("restore", "use the dashboard"),
+        Commands::Exec { .. } => ("exec", "use the Shell tab in the dashboard"),
+        Commands::PortForward { .. } => ("port-forward", NEEDS_CLUSTER),
+        Commands::DbConnect { .. } => (
+            "db-connect",
+            "copy the connection string from the database's page in the dashboard",
+        ),
+        Commands::SecretsSync { .. } => (
+            "secrets-sync",
+            "run `fractal env list <service>` to see its variables",
+        ),
+        Commands::Canary { .. } => ("canary", USE_SERVICE_PAGE),
+        Commands::Tokens {
+            action: TokensCommands::Delete { .. },
+        } => (
+            "tokens delete",
+            "run `fractal tokens revoke`, which keeps an audit trail",
+        ),
+        _ => return None,
+    })
+}
+
+fn dispatch(command: Commands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    if let Some((name, hint)) = hosted_gap(&command) {
+        if ctx.is_api()? {
+            return Err(unavailable(name, hint));
+        }
+    }
+    let rt = ctx.rt;
+    let json = ctx.json;
+    let project = ctx.project();
+    let project = project.as_deref();
     match command {
         Commands::Scale { service, replicas } => {
-            rt.block_on(scale::scale_service(&service, replicas))
+            if ctx.is_api()? {
+                rt.block_on(scale::scale_service_api(project, &service, replicas))
+            } else {
+                rt.block_on(scale::scale_service(&service, replicas))
+            }
         }
         Commands::Restart { service } => rt.block_on(restart::restart_service(&service)),
         Commands::Rollback { service } => rt.block_on(rollback::rollback_service(&service)),
         Commands::Destroy { service } => rt.block_on(destroy::destroy_service(&service)),
         Commands::Restore { service } => rt.block_on(restore::restore_service(&service)),
-        Commands::Env { action } => dispatch_env(action, rt),
+        Commands::Env { action } => dispatch_env(action, ctx),
         Commands::Logs {
             service,
             follow,
             since,
             tail,
             grep,
-        } => rt.block_on(logs::tail_logs(
-            &service,
-            follow,
-            since.as_deref(),
-            tail,
-            grep.as_deref(),
-            json,
-        )),
+            timestamps,
+            previous,
+        } => {
+            let opts = logs::LogOptions {
+                follow,
+                since: since.as_deref(),
+                tail,
+                grep: grep.as_deref(),
+                timestamps,
+                previous,
+                json,
+            };
+            dispatch_logs(&service, &opts, ctx)
+        }
         Commands::Exec { service, tty, cmd } => {
             rt.block_on(exec::exec_in_service(&service, &cmd, tty))
         }
-        Commands::PortForward { service, ports } => match parse_ports(&ports) {
-            Ok((local, remote)) => rt.block_on(port_forward::port_forward(&service, local, remote)),
-            Err(e) => Err(e),
-        },
+        Commands::PortForward { service, ports } => {
+            let (local, remote) = parse_ports(&ports)?;
+            rt.block_on(port_forward::port_forward(&service, local, remote))
+        }
         Commands::DbConnect {
             service,
             print_only,
@@ -457,25 +588,36 @@ fn dispatch(command: Commands, json: bool, rt: &tokio::runtime::Runtime) -> anyh
             output,
             overwrite,
         } => rt.block_on(secrets_sync::sync_secrets(&service, &output, overwrite)),
-        Commands::Members { action } => dispatch_members(action, rt),
+        Commands::Members { action } => dispatch_members(action, ctx),
         Commands::Cluster { action } => dispatch_cluster(action, rt),
-        Commands::Tokens { action } => dispatch_tokens(action, rt),
+        Commands::Tokens { action } => dispatch_tokens(action, ctx),
         Commands::Auth { action } => match action {
-            AuthCommands::Login => rt.block_on(auth::login(json)),
+            AuthCommands::Login { token } => rt.block_on(auth::login(json, token)),
             AuthCommands::Logout => auth::logout(),
-            AuthCommands::Whoami => auth::whoami(json),
+            AuthCommands::Whoami => rt.block_on(auth::whoami(json, ctx.transport()?)),
         },
         Commands::Deploy {
             namespace,
-            project,
             service,
             env,
-        } => rt.block_on(deploy::deploy(&namespace, &project, &service, env)),
-        Commands::Services { namespace } => rt.block_on(services::list_services(namespace, json)),
-        Commands::Projects { action } => match action {
-            ProjectsCommands::List => rt.block_on(projects::list_projects(json)),
-            ProjectsCommands::Get { name } => rt.block_on(projects::get_project(&name, json)),
-        },
+        } => rt.block_on(deploy::deploy(
+            namespace.as_deref(),
+            project,
+            &service,
+            env.as_deref(),
+        )),
+        Commands::Services { namespace } => {
+            if ctx.is_api()? {
+                rt.block_on(services::list_services_api(
+                    project,
+                    namespace.as_deref(),
+                    json,
+                ))
+            } else {
+                rt.block_on(services::list_services(namespace, json))
+            }
+        }
+        Commands::Projects { action } => dispatch_projects(action, ctx),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let bin_name = cmd.get_name().to_string();
@@ -486,10 +628,76 @@ fn dispatch(command: Commands, json: bool, rt: &tokio::runtime::Runtime) -> anyh
     }
 }
 
-fn dispatch_env(action: EnvCommands, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+fn dispatch_logs(service: &str, opts: &logs::LogOptions<'_>, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    if ctx.is_api()? {
+        let project = ctx.project();
+        return ctx
+            .rt
+            .block_on(logs::tail_logs_api(project.as_deref(), service, opts));
+    }
+    ctx.rt.block_on(logs::tail_logs(
+        service,
+        opts.follow,
+        opts.since,
+        opts.tail,
+        opts.grep,
+        opts.previous,
+        opts.json,
+    ))
+}
+
+fn dispatch_projects(action: ProjectsCommands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let rt = ctx.rt;
+    let json = ctx.json;
+    match (action, ctx.is_api()?) {
+        (ProjectsCommands::List, true) => rt.block_on(projects::list_projects_api(json)),
+        (ProjectsCommands::List, false) => rt.block_on(projects::list_projects(json)),
+        (ProjectsCommands::Get { name }, true) => {
+            rt.block_on(projects::get_project_api(&name, json))
+        }
+        (ProjectsCommands::Get { name }, false) => rt.block_on(projects::get_project(&name, json)),
+    }
+}
+
+fn dispatch_env(action: EnvCommands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let rt = ctx.rt;
+    let project = ctx.project();
+    let project = project.as_deref();
+    if ctx.is_api()? {
+        return match action {
+            EnvCommands::List { service } => rt.block_on(env::list_env_api(project, &service)),
+            EnvCommands::Set {
+                service,
+                pair,
+                secret,
+            } => rt.block_on(env::set_env_api(project, &service, &pair, secret)),
+            EnvCommands::SetSecret {
+                service,
+                name,
+                secret,
+                key,
+            } => rt.block_on(env::set_secret_env_api(
+                project, &service, &name, &secret, &key,
+            )),
+            EnvCommands::Unset { service, name } => {
+                rt.block_on(env::unset_env_api(project, &service, &name))
+            }
+        };
+    }
     match action {
         EnvCommands::List { service } => rt.block_on(env::list_env(&service)),
-        EnvCommands::Set { service, pair } => rt.block_on(env::set_env(&service, &pair)),
+        EnvCommands::Set {
+            service,
+            pair,
+            secret,
+        } => {
+            if secret {
+                anyhow::bail!(
+                    "--secret needs the api transport; on kube, create a Secret and use `fractal env set-secret`"
+                );
+            }
+            rt.block_on(env::set_env(&service, &pair))
+        }
         EnvCommands::SetSecret {
             service,
             name,
@@ -500,7 +708,21 @@ fn dispatch_env(action: EnvCommands, rt: &tokio::runtime::Runtime) -> anyhow::Re
     }
 }
 
-fn dispatch_members(action: MembersCommands, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+fn dispatch_members(action: MembersCommands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let rt = ctx.rt;
+    if ctx.is_api()? {
+        return match action {
+            MembersCommands::List { project } => rt.block_on(members::list_members_api(&project)),
+            MembersCommands::Add {
+                project,
+                user,
+                role,
+            } => rt.block_on(members::add_member_api(&project, &user, &role)),
+            MembersCommands::Remove { project, user } => {
+                rt.block_on(members::remove_member_api(&project, &user))
+            }
+        };
+    }
     match action {
         MembersCommands::List { project } => rt.block_on(members::list_members(&project)),
         MembersCommands::Add {
@@ -536,21 +758,47 @@ fn dispatch_cluster(action: ClusterCommands, rt: &tokio::runtime::Runtime) -> an
     }
 }
 
-fn dispatch_tokens(action: TokensCommands, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+fn dispatch_tokens(action: TokensCommands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let rt = ctx.rt;
+    if ctx.is_api()? {
+        return match action {
+            TokensCommands::List { workspace } => {
+                rt.block_on(tokens::list_tokens_api(workspace.as_deref()))
+            }
+            TokensCommands::Create {
+                name,
+                subject,
+                scopes,
+                expires_in_days,
+                workspace,
+            } => rt.block_on(tokens::create_token_api(
+                &name,
+                &subject,
+                scopes,
+                expires_in_days,
+                workspace.as_deref(),
+            )),
+            TokensCommands::Revoke { name, workspace } => {
+                rt.block_on(tokens::revoke_token_api(&name, workspace.as_deref()))
+            }
+            TokensCommands::Delete { .. } => unreachable!("handled by hosted_gap"),
+        };
+    }
     match action {
-        TokensCommands::List => rt.block_on(tokens::list_tokens()),
+        TokensCommands::List { .. } => rt.block_on(tokens::list_tokens()),
         TokensCommands::Create {
             name,
             subject,
             scopes,
             expires_in_days,
+            ..
         } => rt.block_on(tokens::create_token(
             &name,
             &subject,
             scopes,
             expires_in_days,
         )),
-        TokensCommands::Revoke { name } => rt.block_on(tokens::revoke_token(&name)),
+        TokensCommands::Revoke { name, .. } => rt.block_on(tokens::revoke_token(&name)),
         TokensCommands::Delete { name } => rt.block_on(tokens::delete_token(&name)),
     }
 }
@@ -565,5 +813,110 @@ fn dispatch_canary(action: CanaryCommands, rt: &tokio::runtime::Runtime) -> anyh
         CanaryCommands::Promote { service } => rt.block_on(canary::promote_canary(&service)),
         CanaryCommands::Abort { service } => rt.block_on(canary::abort_canary(&service)),
         CanaryCommands::Status { service } => rt.block_on(canary::canary_status(&service)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn global_flags_parse_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "fractal",
+            "deploy",
+            "--project",
+            "demo",
+            "--service",
+            "web",
+            "--transport",
+            "api",
+        ])
+        .unwrap();
+        assert_eq!(cli.project.as_deref(), Some("demo"));
+        assert_eq!(cli.transport, Some(super::Transport::Api));
+    }
+
+    #[test]
+    fn logs_accepts_hosted_flags() {
+        let cli =
+            Cli::try_parse_from(["fractal", "logs", "web", "-f", "--timestamps", "--previous"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Commands::Logs {
+                follow: true,
+                timestamps: true,
+                previous: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn auth_login_takes_token() {
+        let cli = Cli::try_parse_from(["fractal", "auth", "login", "--token", "-"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Commands::Auth {
+                action: super::AuthCommands::Login { token: Some(ref t) }
+            } if t == "-"
+        ));
+    }
+
+    #[test]
+    fn hosted_gaps_are_actionable_and_never_mention_kubeconfig() {
+        let cases = [
+            vec!["fractal", "exec", "web"],
+            vec!["fractal", "port-forward", "web", "8080"],
+            vec!["fractal", "db-connect", "db"],
+            vec!["fractal", "secrets-sync", "web"],
+            vec!["fractal", "restart", "web"],
+            vec!["fractal", "rollback", "web"],
+            vec!["fractal", "destroy", "web"],
+            vec!["fractal", "restore", "web"],
+            vec!["fractal", "canary", "status", "web"],
+            vec!["fractal", "tokens", "delete", "ci"],
+        ];
+        for argv in cases {
+            let cli = Cli::try_parse_from(&argv).unwrap();
+            let (name, hint) = super::hosted_gap(&cli.command)
+                .unwrap_or_else(|| panic!("{argv:?} should be a hosted gap"));
+            let msg = super::unavailable(name, hint).to_string();
+            assert!(msg.starts_with(&format!("`fractal {name}` isn't available")));
+            assert!(!msg.to_lowercase().contains("kubeconfig"), "{msg}");
+        }
+        let exec = Cli::try_parse_from(["fractal", "exec", "web"]).unwrap();
+        assert_eq!(
+            super::unavailable("exec", super::hosted_gap(&exec.command).unwrap().1).to_string(),
+            "`fractal exec` isn't available for hosted workspaces yet; use the Shell tab in the dashboard"
+        );
+    }
+
+    #[test]
+    fn hosted_commands_are_not_gaps() {
+        for argv in [
+            vec!["fractal", "services"],
+            vec!["fractal", "logs", "web"],
+            vec!["fractal", "env", "list", "web"],
+            vec!["fractal", "scale", "web", "-r", "2"],
+            vec!["fractal", "tokens", "list"],
+            vec!["fractal", "members", "list", "demo"],
+            vec!["fractal", "deploy", "--service", "web"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).unwrap();
+            assert!(super::hosted_gap(&cli.command).is_none(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_transport() {
+        assert!(Cli::try_parse_from(["fractal", "--transport", "ssh", "services"]).is_err());
     }
 }

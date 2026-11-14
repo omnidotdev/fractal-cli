@@ -1,12 +1,12 @@
-//! `fractal auth login | logout | whoami` — Better Auth email/password
+//! `fractal auth login | logout | whoami`. Login either stores a Fractal
+//! API token (`--token ftk_...`) or runs the Better Auth email/password
 //! flow against identity.omni.dev (matches the omni-cli pattern at
 //! `cli-stack/services/cli/src/cli/auth.rs`).
 //!
-//! Token is persisted to `~/.config/fractal/config.toml` (0600 on
-//! Unix). Other commands that need to call fractal-api pick it up via
-//! `crate::cluster::auth_token()`, which falls through to
-//! `FRACTAL_AUTH_TOKEN` env when the config has no token. The env
-//! override stays for CI scenarios.
+//! The token is persisted to `~/.config/fractal/config.toml` (0600 on
+//! Unix). Commands resolve their credential through
+//! `crate::api::credential()`: `FRACTAL_API_TOKEN`, then the older
+//! `FRACTAL_AUTH_TOKEN`, then the persisted token.
 //!
 //! A device-code grant against Gatekeeper would be cleaner but the
 //! discovery doc at `https://identity.omni.dev/.well-known/oauth-authorization-server`
@@ -19,7 +19,9 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
+use crate::api::{self, Credential, CredentialSource};
 use crate::config::Config;
+use crate::transport::Transport;
 
 const DEFAULT_AUTH_URL: &str = "https://identity.omni.dev";
 
@@ -29,19 +31,19 @@ fn auth_url() -> String {
     std::env::var("FRACTAL_AUTH_URL").unwrap_or_else(|_| DEFAULT_AUTH_URL.to_string())
 }
 
-/// Bearer token supplied out-of-band via `FRACTAL_AUTH_TOKEN` (CI and
-/// automation). Empty is treated as unset. This is the same override
-/// the API-calling commands resolve first (see `cluster::api_session`),
-/// so when it is present an interactive `fractal auth login` is
-/// unnecessary.
-fn env_token() -> Option<String> {
-    std::env::var("FRACTAL_AUTH_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
+/// Credential supplied out-of-band through `FRACTAL_API_TOKEN` or
+/// `FRACTAL_AUTH_TOKEN` (CI and automation). When present, an
+/// interactive `fractal auth login` is unnecessary.
+fn env_credential() -> Option<Credential> {
+    api::select_credential(
+        std::env::var(api::TOKEN_ENV).ok().as_deref(),
+        std::env::var(api::LEGACY_TOKEN_ENV).ok().as_deref(),
+        None,
+    )
 }
 
 /// Machine-readable identity for `fractal auth whoami --json`.
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct WhoamiInfo {
     authenticated: bool,
@@ -53,6 +55,15 @@ struct WhoamiInfo {
     email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_id: Option<String>,
+    /// Transport commands will use (`api` or `kube`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<String>,
+    /// API base URL, when the transport is `api`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_url: Option<String>,
+    /// Projects the credential can see, when verified against the API
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projects: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -83,23 +94,25 @@ struct LoginUser {
 ///
 /// Returns an error if stdin can't be read, the login request fails,
 /// or the config can't be written.
-pub async fn login(json: bool) -> Result<()> {
-    if env_token().is_some() {
+pub async fn login(json: bool, token: Option<String>) -> Result<()> {
+    if let Some(token) = token {
+        return login_with_token(json, &token).await;
+    }
+    if let Some(cred) = env_credential() {
         if json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&WhoamiInfo {
                     authenticated: true,
                     source: Some("env"),
-                    email: None,
-                    user_id: None,
+                    ..WhoamiInfo::default()
                 })?
             );
         } else {
             println!(
                 "{} {} is set; it authenticates every command, so no login is needed",
                 "Already authenticated.".bold(),
-                "FRACTAL_AUTH_TOKEN".cyan(),
+                cred.source.label().cyan(),
             );
         }
         return Ok(());
@@ -154,6 +167,7 @@ pub async fn login(json: bool) -> Result<()> {
                 source: Some("config"),
                 email: cfg.auth.email,
                 user_id: cfg.auth.user_id,
+                ..WhoamiInfo::default()
             })?
         );
     } else if let Some(display) = &cfg.auth.email {
@@ -185,37 +199,125 @@ pub fn logout() -> Result<()> {
     Ok(())
 }
 
-/// Print the currently logged-in identity. Resolves `FRACTAL_AUTH_TOKEN`
-/// first (the CI/automation override), then the persisted login config.
-/// No network call either way.
+/// Read the token for `--token`: the value itself, or stdin for `-`
+fn read_token_arg(arg: &str, stdin: impl io::BufRead) -> Result<String> {
+    let token = if arg == "-" {
+        let mut line = String::new();
+        let mut stdin = stdin;
+        stdin
+            .read_line(&mut line)
+            .context("failed to read the token from stdin")?;
+        line
+    } else {
+        arg.to_string()
+    };
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("the token is empty");
+    }
+    Ok(token)
+}
+
+/// Count the projects a credential can see. Doubles as a check that the
+/// API accepts it.
+async fn verify(token: &str) -> Result<usize> {
+    let client = api::ApiClient::new(&api::api_url(), token)?;
+    Ok(api::resolve::list_projects(&client).await?.len())
+}
+
+/// Persist a Fractal API token after checking that the API accepts it
+async fn login_with_token(json: bool, arg: &str) -> Result<()> {
+    let token = read_token_arg(arg, io::stdin().lock())?;
+    let projects = verify(&token).await?;
+
+    let mut cfg = Config::load()?;
+    cfg.auth.access_token = Some(token);
+    cfg.auth.user_id = None;
+    cfg.auth.email = None;
+    cfg.save()?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&WhoamiInfo {
+                authenticated: true,
+                source: Some("config"),
+                api_url: Some(api::api_url()),
+                projects: Some(projects),
+                ..WhoamiInfo::default()
+            })?
+        );
+        return Ok(());
+    }
+    println!(
+        "{} API token saved ({} project{} visible)",
+        "\u{2713}".green(),
+        projects,
+        if projects == 1 { "" } else { "s" }
+    );
+    if let Some(cred) = env_credential() {
+        println!(
+            "{} {} is set and takes precedence over the saved token",
+            "Note:".yellow(),
+            cred.source.label().cyan()
+        );
+    }
+    if cfg.transport.as_deref() == Some("kube") {
+        println!(
+            "{} this machine is set to the kube transport (from `fractal cluster connect`); pass {} or set {} to use the API",
+            "Note:".yellow(),
+            "--transport api".cyan(),
+            "FRACTAL_TRANSPORT=api".cyan()
+        );
+    }
+    Ok(())
+}
+
+/// Print the active identity. Resolves `FRACTAL_API_TOKEN`, then
+/// `FRACTAL_AUTH_TOKEN`, then the persisted login. On the API transport
+/// the credential is checked against the API; on kube there is no
+/// network call.
 ///
 /// # Errors
 ///
-/// Returns an error if the config can't be loaded or JSON serialization
-/// fails.
-pub fn whoami(json: bool) -> Result<()> {
+/// Returns an error if the config can't be loaded, the API rejects the
+/// credential, or JSON serialization fails.
+pub async fn whoami(json: bool, transport: Transport) -> Result<()> {
     let cfg = Config::load()?;
-    let info = if env_token().is_some() {
-        WhoamiInfo {
-            authenticated: true,
-            source: Some("env"),
-            email: cfg.auth.email,
-            user_id: cfg.auth.user_id,
+    let Some(cred) = api::credential_from(&cfg) else {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&WhoamiInfo {
+                    transport: Some(transport.to_string()),
+                    ..WhoamiInfo::default()
+                })?
+            );
+        } else {
+            println!(
+                "{} run {} or set {} to authenticate",
+                "Not logged in.".bold(),
+                "fractal auth login".cyan(),
+                "FRACTAL_API_TOKEN".cyan(),
+            );
         }
-    } else if cfg.auth.access_token.is_some() {
-        WhoamiInfo {
-            authenticated: true,
-            source: Some("config"),
-            email: cfg.auth.email,
-            user_id: cfg.auth.user_id,
-        }
+        return Ok(());
+    };
+
+    let (projects, api_url) = if transport == Transport::Api {
+        (Some(verify(&cred.token).await?), Some(api::api_url()))
     } else {
-        WhoamiInfo {
-            authenticated: false,
-            source: None,
-            email: None,
-            user_id: None,
-        }
+        (None, None)
+    };
+
+    let info = WhoamiInfo {
+        authenticated: true,
+        source: Some(cred.source.json_value()),
+        email: cfg.auth.email,
+        user_id: cfg.auth.user_id,
+        transport: Some(transport.to_string()),
+        api_url,
+        projects,
     };
 
     if json {
@@ -223,35 +325,30 @@ pub fn whoami(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    match (info.authenticated, info.source, info.email.as_deref()) {
-        (true, Some("env"), Some(email)) => {
-            println!(
-                "{} {} ({})",
-                "Authenticated as".bold(),
-                email.cyan(),
-                "via FRACTAL_AUTH_TOKEN".dimmed(),
-            );
-        }
-        (true, Some("env"), None) => {
-            println!(
-                "{} {}",
-                "Authenticated".bold(),
-                "via FRACTAL_AUTH_TOKEN".dimmed(),
-            );
-        }
-        (true, _, Some(email)) => {
-            println!("{} {}", "Logged in as".bold(), email.cyan());
-        }
-        (true, _, None) => {
-            println!("{}", "Logged in (no email on record)".bold());
-        }
-        _ => {
-            println!(
-                "{} run {} to authenticate",
-                "Not logged in.".bold(),
-                "fractal auth login".cyan(),
-            );
-        }
+    let who = info.email.as_deref().map_or_else(
+        || {
+            if cred.token.starts_with("ftk_") {
+                "with an API token".to_string()
+            } else {
+                "(no email on record)".to_string()
+            }
+        },
+        |e| format!("as {}", e.cyan()),
+    );
+    let via = match cred.source {
+        CredentialSource::Config => "saved login".to_string(),
+        other => other.label().to_string(),
+    };
+    println!(
+        "{} {} ({})",
+        "Authenticated".bold(),
+        who,
+        format!("via {via}").dimmed()
+    );
+    println!("  {} {}", "Transport:".bold(), transport);
+    if let (Some(url), Some(n)) = (info.api_url.as_deref(), info.projects) {
+        println!("  {} {}", "API:".bold(), url.dimmed());
+        println!("  {} {n}", "Projects:".bold());
     }
     Ok(())
 }
@@ -264,4 +361,28 @@ fn prompt(label: &str) -> Result<String> {
         .read_line(&mut input)
         .context("failed to read stdin")?;
     Ok(input.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_token_arg;
+
+    #[test]
+    fn token_arg_is_trimmed() {
+        assert_eq!(read_token_arg("  ftk_abc \n", &b""[..]).unwrap(), "ftk_abc");
+    }
+
+    #[test]
+    fn dash_reads_token_from_stdin() {
+        assert_eq!(
+            read_token_arg("-", &b"ftk_piped\n"[..]).unwrap(),
+            "ftk_piped"
+        );
+    }
+
+    #[test]
+    fn empty_token_is_rejected() {
+        assert!(read_token_arg("-", &b"\n"[..]).is_err());
+        assert!(read_token_arg("  ", &b""[..]).is_err());
+    }
 }
