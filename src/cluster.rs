@@ -13,14 +13,6 @@ use kube::{Api, Client, Config};
 /// install command for users on the OSS path.
 const DEFAULT_BUNDLE_URL: &str = "https://fractal.omni.dev/install/operator.yaml";
 
-/// Gatekeeper-issued bearer token or Fractal API token used to
-/// authenticate the mint call. Resolved by `crate::api::credential()`:
-/// `FRACTAL_API_TOKEN`, then `FRACTAL_AUTH_TOKEN`, then the token saved
-/// by `fractal auth login`.
-fn auth_token() -> Option<String> {
-    crate::api::credential().map(|c| c.token)
-}
-
 /// Shape of `POST /v1/clusters/install-tokens` request body. Currently
 /// just the optional human-readable cluster label.
 #[derive(serde::Serialize)]
@@ -60,10 +52,12 @@ struct ListedInstallTokensResponse {
 }
 
 /// Build a reqwest client and resolve the API URL + token, using the
-/// same precedence as every other API-backed command
-fn api_session() -> Result<(String, String, reqwest::Client)> {
+/// same precedence as every other API-backed command: `FRACTAL_API_TOKEN`,
+/// then `FRACTAL_AUTH_TOKEN`, then the saved login (refreshed first when
+/// it is about to expire)
+async fn api_session() -> Result<(String, String, reqwest::Client)> {
     let base = crate::api::api_url();
-    let token = auth_token().context(crate::api::NOT_AUTHENTICATED)?;
+    let token = crate::api::ApiClient::from_env()?.bearer_token().await?;
     let client = reqwest::Client::builder()
         .build()
         .context("failed to build HTTP client")?;
@@ -77,7 +71,7 @@ fn api_session() -> Result<(String, String, reqwest::Client)> {
 /// Returns an error if the API URL or auth token env vars are missing,
 /// the HTTP call fails, or the server returns a non-2xx status.
 async fn mint_install_token(cluster_name: Option<&str>) -> Result<MintTokenResponse> {
-    let (base, token, client) = api_session()?;
+    let (base, token, client) = api_session().await?;
     let url = format!("{}/v1/clusters/install-tokens", base.trim_end_matches('/'));
     let resp = client
         .post(&url)
@@ -114,7 +108,7 @@ async fn mint_install_token(cluster_name: Option<&str>) -> Result<MintTokenRespo
 /// Returns an error if env vars are missing, the HTTP call fails, or
 /// the server returns a non-2xx status.
 pub async fn list_tokens() -> Result<()> {
-    let (base, token, client) = api_session()?;
+    let (base, token, client) = api_session().await?;
     let url = format!("{}/v1/clusters/install-tokens", base.trim_end_matches('/'));
     let resp = client
         .get(&url)
@@ -182,7 +176,7 @@ pub async fn list_tokens() -> Result<()> {
 /// Returns an error if env vars are missing, the HTTP call fails, or
 /// the server returns a non-2xx status.
 pub async fn revoke_token(id: &str) -> Result<()> {
-    let (base, token, client) = api_session()?;
+    let (base, token, client) = api_session().await?;
     let url = format!(
         "{}/v1/clusters/install-tokens/{}",
         base.trim_end_matches('/'),
@@ -442,7 +436,7 @@ pub async fn connect(
 
     println!();
 
-    if auth_token().is_some()
+    if crate::api::credential().is_some()
         && try_mint_and_print(
             cluster_name.as_deref(),
             registry.as_deref(),

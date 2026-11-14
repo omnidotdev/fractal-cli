@@ -10,6 +10,7 @@ mod env;
 mod exec;
 mod logs;
 mod members;
+mod oauth;
 mod port_forward;
 mod projects;
 mod restart;
@@ -36,7 +37,7 @@ struct Cli {
     command: Commands,
     /// Emit machine-readable JSON instead of human-formatted output.
     /// Honored by the read commands: `services`, `projects list`/`get`,
-    /// `auth whoami`, and `logs` (stream metadata plus NDJSON lines).
+    /// `whoami`, and `logs` (stream metadata plus NDJSON lines).
     /// Other commands ignore it and keep their human output.
     #[arg(long, global = true)]
     json: bool,
@@ -186,6 +187,16 @@ enum Commands {
         #[command(subcommand)]
         action: TokensCommands,
     },
+    /// Log in through the browser. Saves a session that refreshes
+    /// itself; `--token` saves a Fractal API token instead
+    Login {
+        #[command(flatten)]
+        args: LoginArgs,
+    },
+    /// Log out: revoke the browser session and clear saved credentials
+    Logout,
+    /// Print the currently logged-in identity
+    Whoami,
     /// Authenticate with the Fractal control plane
     Auth {
         #[command(subcommand)]
@@ -281,19 +292,30 @@ enum CanaryCommands {
 
 #[derive(Subcommand)]
 enum AuthCommands {
-    /// Save a Fractal API token (`--token`), or log in with email +
-    /// password. Either way the bearer token is persisted at
-    /// ~/.config/fractal/config.toml
+    /// Log in through the browser (same as `fractal login`), or save a
+    /// Fractal API token with `--token`
     Login {
-        /// Fractal API token (`ftk_...`) to save. Pass `-` to read it
-        /// from stdin so it stays out of shell history
-        #[arg(long)]
-        token: Option<String>,
+        #[command(flatten)]
+        args: LoginArgs,
     },
-    /// Clear the persisted bearer token
+    /// Log out: revoke the browser session and clear saved credentials
     Logout,
     /// Print the currently logged-in identity
     Whoami,
+}
+
+#[derive(clap::Args)]
+struct LoginArgs {
+    /// Save a Fractal API token (`ftk_...`) instead of logging in
+    /// through the browser. Pass `-` to read it from stdin so it stays
+    /// out of shell history
+    #[arg(long, conflicts_with = "no_browser")]
+    token: Option<String>,
+    /// Don't open a browser: print the sign-in URL and paste back the
+    /// URL the browser lands on. Used automatically over SSH or with no
+    /// display
+    #[arg(long)]
+    no_browser: bool,
 }
 
 #[derive(Subcommand)]
@@ -591,11 +613,10 @@ fn dispatch(command: Commands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
         Commands::Members { action } => dispatch_members(action, ctx),
         Commands::Cluster { action } => dispatch_cluster(action, rt),
         Commands::Tokens { action } => dispatch_tokens(action, ctx),
-        Commands::Auth { action } => match action {
-            AuthCommands::Login { token } => rt.block_on(auth::login(json, token)),
-            AuthCommands::Logout => auth::logout(),
-            AuthCommands::Whoami => rt.block_on(auth::whoami(json, ctx.transport()?)),
-        },
+        Commands::Login { args } => dispatch_auth(AuthCommands::Login { args }, ctx),
+        Commands::Logout => dispatch_auth(AuthCommands::Logout, ctx),
+        Commands::Whoami => dispatch_auth(AuthCommands::Whoami, ctx),
+        Commands::Auth { action } => dispatch_auth(action, ctx),
         Commands::Deploy {
             namespace,
             service,
@@ -758,6 +779,18 @@ fn dispatch_cluster(action: ClusterCommands, rt: &tokio::runtime::Runtime) -> an
     }
 }
 
+/// `fractal login | logout | whoami`, also reachable under `fractal auth`
+fn dispatch_auth(action: AuthCommands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    match action {
+        AuthCommands::Login { args } => {
+            ctx.rt
+                .block_on(auth::login(ctx.json, args.token, args.no_browser))
+        }
+        AuthCommands::Logout => ctx.rt.block_on(auth::logout()),
+        AuthCommands::Whoami => ctx.rt.block_on(auth::whoami(ctx.json, ctx.transport()?)),
+    }
+}
+
 fn dispatch_tokens(action: TokensCommands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
     let rt = ctx.rt;
     if ctx.is_api()? {
@@ -865,9 +898,38 @@ mod tests {
         assert!(matches!(
             cli.command,
             super::Commands::Auth {
-                action: super::AuthCommands::Login { token: Some(ref t) }
-            } if t == "-"
+                action: super::AuthCommands::Login { ref args }
+            } if args.token.as_deref() == Some("-") && !args.no_browser
         ));
+    }
+
+    #[test]
+    fn top_level_login_logout_whoami_parse() {
+        let cli = Cli::try_parse_from(["fractal", "login", "--no-browser"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Commands::Login { ref args } if args.no_browser && args.token.is_none()
+        ));
+        let cli = Cli::try_parse_from(["fractal", "login"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Commands::Login { ref args } if !args.no_browser && args.token.is_none()
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["fractal", "logout"]).unwrap().command,
+            super::Commands::Logout
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["fractal", "--json", "whoami"])
+                .unwrap()
+                .command,
+            super::Commands::Whoami
+        ));
+    }
+
+    #[test]
+    fn token_and_no_browser_conflict() {
+        assert!(Cli::try_parse_from(["fractal", "login", "--token", "x", "--no-browser"]).is_err());
     }
 
     #[test]
