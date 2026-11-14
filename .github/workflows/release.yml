@@ -67,7 +67,12 @@ jobs:
         working-directory: fractal-cli
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }}
+          # Stamped into `fractal --version` by build.rs; the run number
+          # is the same N as the `cli-v<N>` release tag
+          FRACTAL_BUILD: ${{ github.run_number }}
+        run: |
+          export FRACTAL_GIT_SHA="${GITHUB_SHA::7}"
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Package binary
         working-directory: fractal-cli

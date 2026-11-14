@@ -43,6 +43,8 @@ fractal --version
 
 To pin a specific build, swap `latest/download` for `download/cli-v<build-number>` (e.g. `download/cli-v42`); the available builds are listed on the releases page.
 
+`fractal --version` reports the build it came from, e.g. `fractal 0.1.0 (build 42, 1a2b3c4)` for the `cli-v42` release. A binary built from source reports `(dev)`.
+
 Homebrew, AUR, and cargo-registry packages are not yet available.
 
 ### Build from source
@@ -93,13 +95,16 @@ The unavailable commands exit immediately with a short message saying what to us
 Hosted-only options:
 
 - `fractal env set my-service API_KEY=... --secret` stores the value as a managed secret: it is sent write-only and never shown again (`env list` shows a masked reference).
-- `fractal logs` takes `--timestamps` to keep each line's timestamp and `--previous` to read the previous (crashed) container. Logs cover up to 10 pods, newest first, with 200 lines per pod by default (`--tail` up to 5000); `--follow` polls every 2 seconds. A service that is sleeping or scaled to zero has no pods; `logs` says so instead of failing, and `--follow` waits for it to start.
+- `fractal logs` takes `--timestamps` to keep each line's timestamp and `--previous` to read the previous (crashed) container. Logs cover up to 10 pods, newest first, with 200 lines per pod by default (`--tail` up to 5000); `--follow` polls every 2 seconds. `--since` (on either transport) takes a whole number plus a unit, `s`, `m`, `h`, or `d` (e.g. `30s`, `5m`, `1h`, `2d`); anything else, such as a bare `60`, is rejected. A service that is sleeping or scaled to zero has no pods; `logs` says so instead of failing, and `--follow` waits for it to start.
 - `fractal tokens` commands work on your workspace. After `fractal login` it is read from your account when you belong to exactly one workspace, otherwise inferred from your projects. Pass `--workspace <id>` (or set `FRACTAL_WORKSPACE`) if you belong to more than one; `fractal --json whoami` lists the ids.
 - `fractal tokens create --scope <project>` restricts a token to specific projects. Pass the project's name from the `NAME` column of `fractal projects list`, not its slug: the API matches scopes against project names.
 
 ## Quick Start (BYOC / kube)
 
 ```sh
+# log in first: the operator install URL is minted for your account
+fractal login
+
 # onboard your cluster; this also sets the transport to kube on this machine
 fractal cluster connect --name us-east-prod
 
@@ -118,7 +123,7 @@ The CLI picks a transport per command, highest precedence first:
 
 1. The `--transport api|kube` flag.
 2. The `FRACTAL_TRANSPORT` env var (`api` or `kube`).
-3. `transport` in `~/.config/fractal/config.toml`. `fractal cluster connect` writes `transport = "kube"`, so a BYOC machine keeps talking to its own cluster even after an API login.
+3. `transport` in the config file, in your OS config dir (`~/.config/fractal/config.toml` on Linux, `~/Library/Application Support/fractal/config.toml` on macOS). `fractal cluster connect` writes `transport = "kube"`, so a BYOC machine keeps talking to its own cluster even after an API login; `fractal cluster disconnect` clears it.
 4. Otherwise `api` when a credential is present (`FRACTAL_API_TOKEN`, `FRACTAL_AUTH_TOKEN`, or a saved login) and `kube` when none is.
 
 `deploy` always goes through the API, and the `cluster` commands always use kubeconfig, whatever the transport. Run `fractal whoami` to see which transport is active.
@@ -201,8 +206,8 @@ The config file (see [Credential precedence](#credential-precedence) for its pat
 `fractal cluster connect` onboards a Kubernetes cluster to Fractal. It:
 
 1. Resolves your kubeconfig (from `--kubeconfig`, then `KUBECONFIG`, then `~/.kube/config`), validates it, and sanity-pings the apiserver to confirm connectivity and report reachable nodes.
-2. When authenticated (`fractal login`, or `FRACTAL_API_TOKEN`), mints a single-use install token from the control-plane API and prints a signed install URL. Otherwise it falls back to the static open-source install bundle URL.
-3. Prints the `kubectl apply` command to install the fractal-operator into the `fractal-system` namespace.
+2. Mints a single-use install token from the control-plane API and prints a signed install URL. This needs a credential, so run `fractal login` (or set `FRACTAL_API_TOKEN`) first; without one, `cluster connect` stops and tells you to log in.
+3. Prints the `curl ... | kubectl apply -f -` command that installs the fractal-operator into the `fractal-system` namespace.
 4. Saves `transport = "kube"` in the CLI config, so later commands on this machine use your kubeconfig even if you also log in.
 
 ```sh
@@ -219,7 +224,9 @@ After applying the printed manifest, verify the operator is running:
 fractal cluster status
 ```
 
-Related cluster commands: `fractal cluster list-tokens` and `fractal cluster revoke-token <id>`. `fractal cluster disconnect` does not remove anything yet: it prints how to stop the operator (`kubectl -n fractal-system delete deploy fractal-operator`). To point the CLI back at the hosted API on a machine that ran `cluster connect`, pass `--transport api`, set `FRACTAL_TRANSPORT=api`, or remove the `transport` line from the config file.
+Related cluster commands: `fractal cluster list-tokens` and `fractal cluster revoke-token <id>`.
+
+To point the CLI back at the hosted API on a machine that ran `cluster connect`, run `fractal cluster disconnect`. It clears the saved `transport = "kube"` (keeping your login), so commands default to `api` again when you are logged in. It does not touch the cluster: workloads keep running, and it prints the command that removes the operator (`kubectl -n fractal-system delete deploy fractal-operator`). For a one-off, pass `--transport api` or set `FRACTAL_TRANSPORT=api` instead.
 
 ## Development
 
