@@ -1,16 +1,16 @@
 //! `fractal deploy` - trigger a rebuild on a `FractalService` via the
-//! authed fractal-api endpoint. Designed for CI use; the existing
-//! `fractal restart` does the same job via kubectl, but assumes the
-//! caller has cluster RBAC. `deploy` goes through fractal-api's
-//! project RBAC instead (Gatekeeper JWT + `developer` role required).
+//! authed Fractal API. Works the same on every transport: the API checks
+//! project RBAC (`developer` role or higher), so CI runners need only a
+//! token, never cluster access.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use colored::Colorize;
+use reqwest::Method;
 use serde::Serialize;
 
-use crate::cluster::api_session;
+use crate::api;
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug, PartialEq, Eq)]
 struct RebuildRequest<'a> {
     namespace: &'a str,
     project: &'a str,
@@ -19,56 +19,85 @@ struct RebuildRequest<'a> {
     env: Option<&'a str>,
 }
 
-/// Trigger a rebuild on `namespace/service` (a `FractalService`).
-/// `project` is the parent `FractalProject` name (used for RBAC) and
-/// `env` optionally narrows the rebuild to a single environment.
+/// Trigger a rebuild on `service`. `project` is the parent project
+/// (used for RBAC); when omitted it is found by searching your projects
+/// for the service. The namespace is the one the service lives in, read
+/// from the API, unless `--namespace` pins it. `env` narrows the rebuild
+/// to one environment; it travels in the request body, never as a
+/// derived namespace.
 ///
 /// # Errors
 ///
-/// Returns an error if env vars are missing, the HTTP call fails, the
-/// server returns a non-2xx status, or the caller doesn't have
-/// `developer` or higher on the project.
+/// Returns an error if no credential is configured, the service can't be
+/// located, the HTTP call fails, or the caller lacks `developer` or
+/// higher on the project.
 pub async fn deploy(
-    namespace: &str,
-    project: &str,
+    namespace: Option<&str>,
+    project: Option<&str>,
     service: &str,
-    env: Option<String>,
+    env: Option<&str>,
 ) -> Result<()> {
-    let (base, token, client) = api_session()?;
-    let url = format!("{}/v1/services/rebuild", base.trim_end_matches('/'),);
-    let resp = client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&RebuildRequest {
-            namespace,
-            project,
-            service,
-            env: env.as_deref(),
-        })
-        .send()
-        .await
-        .with_context(|| format!("POST {url} failed"))?;
+    let client = api::ApiClient::from_env()?;
+    let namespace = namespace.map(str::trim).filter(|s| !s.is_empty());
+    let env = env.map(str::trim).filter(|s| !s.is_empty());
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "rebuild endpoint returned {status}: {}",
-            if body.is_empty() {
-                "<empty body>"
-            } else {
-                &body
-            }
-        );
-    }
+    let (project, namespace) = match (project, namespace) {
+        // Fully specified (the CI shape): no lookups
+        (Some(p), Some(ns)) => (p.to_string(), ns.to_string()),
+        (project, explicit) => {
+            let at = api::resolve::locate_service(&client, project, service).await?;
+            let ns = explicit.map_or_else(|| at.namespace(), str::to_string);
+            (at.project, ns)
+        }
+    };
+
+    let _: serde_json::Value = client
+        .send(
+            Method::POST,
+            "/v1/services/rebuild",
+            &RebuildRequest {
+                namespace: &namespace,
+                project: &project,
+                service,
+                env,
+            },
+        )
+        .await?;
 
     println!(
         "{} rebuild triggered for {}/{}{}",
         "\u{2713}".green(),
         namespace.cyan(),
         service.cyan(),
-        env.as_deref()
-            .map_or_else(String::new, |e| format!(" (env: {e})")),
+        env.map_or_else(String::new, |e| format!(" (env: {e})")),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RebuildRequest;
+
+    #[test]
+    fn rebuild_body_matches_api_contract() {
+        let body = RebuildRequest {
+            namespace: "fractal-demo",
+            project: "demo",
+            service: "web",
+            env: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "namespace": "fractal-demo", "project": "demo", "service": "web" })
+        );
+        let with_env = RebuildRequest {
+            env: Some("staging"),
+            ..body
+        };
+        // The env rides in the body; the namespace stays the service's own
+        assert_eq!(
+            serde_json::to_value(&with_env).unwrap(),
+            serde_json::json!({ "namespace": "fractal-demo", "project": "demo", "service": "web", "env": "staging" })
+        );
+    }
 }

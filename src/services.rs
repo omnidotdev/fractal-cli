@@ -13,6 +13,8 @@ use serde::Serialize;
 
 use fractal_operator::crd::service::{FractalService, ServiceType};
 
+use crate::api;
+
 /// A single service as rendered for `--json`. Field names are
 /// camelCase to match the platform's CRD wire convention. Monorepo and
 /// cron fields are omitted when empty so a plain web service stays
@@ -136,12 +138,7 @@ pub async fn list_services(namespace: Option<String>, json: bool) -> Result<()> 
     );
     for svc in &services.items {
         let row = service_row(svc);
-        let phase_colored = match row.phase.as_str() {
-            "Running" => row.phase.green().to_string(),
-            "Crashed" | "Failed" => row.phase.red().to_string(),
-            "PendingDeletion" => row.phase.yellow().to_string(),
-            _ => row.phase.dimmed().to_string(),
-        };
+        let phase_colored = color_phase(&row.phase);
         let ready_label = format!("{}/{}", row.ready_replicas, row.desired_replicas);
         println!(
             "{:<32}  {:<10}  {:<10}  {:<8}  {}",
@@ -156,9 +153,165 @@ pub async fn list_services(namespace: Option<String>, json: bool) -> Result<()> 
     Ok(())
 }
 
+fn color_phase(phase: &str) -> String {
+    match phase {
+        "Running" => phase.green().to_string(),
+        "Crashed" | "Failed" => phase.red().to_string(),
+        "PendingDeletion" => phase.yellow().to_string(),
+        _ => phase.dimmed().to_string(),
+    }
+}
+
+/// Build the machine-readable row for a service read over the API. The
+/// shape is identical to the kube transport's row.
+fn api_service_row(svc: &api::model::Service) -> ServiceRow {
+    let status = svc.status.as_ref();
+    let image = status
+        .and_then(|s| s.current_image.clone())
+        .filter(|i| !i.is_empty())
+        .or_else(|| {
+            let src = svc.spec.source.as_ref()?;
+            Some(format!(
+                "{}:{}",
+                src.repository.as_ref()?,
+                src.tag.as_ref()?
+            ))
+        })
+        .unwrap_or_else(|| "(no image)".to_string());
+    let build = svc.spec.build.as_ref();
+    ServiceRow {
+        name: svc.name().to_string(),
+        service_type: svc.spec.service_type.clone(),
+        phase: status
+            .and_then(|s| s.phase.clone())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "Pending".to_string()),
+        ready_replicas: status.and_then(|s| s.ready_replicas).unwrap_or(0),
+        desired_replicas: status.and_then(|s| s.desired_replicas).unwrap_or(0),
+        image,
+        root_dir: build
+            .and_then(|b| b.root_dir.clone())
+            .filter(|d| !d.is_empty()),
+        watch_paths: build.map(|b| b.watch_paths.clone()).unwrap_or_default(),
+        schedule: svc
+            .spec
+            .deploy
+            .as_ref()
+            .and_then(|d| d.schedule.clone())
+            .filter(|s| !s.is_empty()),
+    }
+}
+
+/// Collect `(project, row)` pairs over the API: one project when
+/// `project` is set, else every visible project. `namespace` narrows the
+/// rows to that namespace.
+async fn collect_api_rows(
+    client: &api::ApiClient,
+    project: Option<&str>,
+    namespace: Option<&str>,
+) -> Result<Vec<(String, ServiceRow)>> {
+    let projects = match project {
+        Some(ident) => vec![api::resolve::find_project(client, ident).await?],
+        None => api::resolve::list_projects(client).await?,
+    };
+    let mut rows = Vec::new();
+    for proj in projects {
+        for svc in api::resolve::list_services(client, proj.name()).await? {
+            if namespace.is_some_and(|ns| svc.namespace() != Some(ns)) {
+                continue;
+            }
+            rows.push((proj.name().to_string(), api_service_row(&svc)));
+        }
+    }
+    Ok(rows)
+}
+
+/// List services over the hosted API. `--json` emits the same row shape
+/// as the kube transport; the human table adds a PROJECT column.
+///
+/// # Errors
+///
+/// Returns an error if the API is unreachable or rejects the request.
+pub async fn list_services_api(
+    project: Option<&str>,
+    namespace: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let client = api::ApiClient::from_env()?;
+    let rows = collect_api_rows(&client, project, namespace).await?;
+
+    if json {
+        let rows: Vec<&ServiceRow> = rows.iter().map(|(_, r)| r).collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("{}", "(no services)".dimmed());
+        return Ok(());
+    }
+
+    println!(
+        "{:<24}  {:<32}  {:<10}  {:<10}  {:<8}  {}",
+        "PROJECT".bold(),
+        "NAME".bold(),
+        "TYPE".bold(),
+        "PHASE".bold(),
+        "READY".bold(),
+        "IMAGE".bold(),
+    );
+    for (proj, row) in &rows {
+        let ready_label = format!("{}/{}", row.ready_replicas, row.desired_replicas);
+        println!(
+            "{:<24}  {:<32}  {:<10}  {:<10}  {:<8}  {}",
+            proj.dimmed(),
+            row.name.cyan(),
+            row.service_type.dimmed(),
+            color_phase(&row.phase),
+            ready_label.dimmed(),
+            row.image.dimmed(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ServiceRow, ServiceType, service_type_label};
+    use super::{ServiceRow, ServiceType, api_service_row, service_type_label};
+    use crate::api::model::{ServicesData, fixtures::SERVICES_JSON};
+    use crate::api::parse_graphql;
+
+    #[test]
+    fn api_rows_match_kube_row_shape() {
+        let d: ServicesData = parse_graphql(200, SERVICES_JSON).unwrap();
+        let web = serde_json::to_value(api_service_row(&d.fractal_services[0])).unwrap();
+        assert_eq!(
+            web,
+            serde_json::json!({
+                "name": "web",
+                "serviceType": "web",
+                "phase": "Running",
+                "readyReplicas": 2,
+                "desiredReplicas": 2,
+                "image": "reg/demo-web:sha-abc1234",
+                "rootDir": "apps/web",
+                "watchPaths": ["apps/web", "packages/ui"],
+            })
+        );
+        let cron = serde_json::to_value(api_service_row(&d.fractal_services[1])).unwrap();
+        assert_eq!(
+            cron,
+            serde_json::json!({
+                "name": "nightly",
+                "serviceType": "cronJob",
+                "phase": "Pending",
+                "readyReplicas": 0,
+                "desiredReplicas": 0,
+                "image": "reg/nightly:v1",
+                "schedule": "0 3 * * *",
+            })
+        );
+    }
 
     #[test]
     fn service_type_label_matches_crd_camelcase() {

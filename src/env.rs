@@ -5,6 +5,10 @@ use kube::api::{Api, Patch, PatchParams};
 
 use fractal_operator::crd::service::{EnvVar, EnvVarSource, FractalService, SecretRef};
 
+use crate::api;
+use crate::api::model;
+use crate::api::resolve::Located;
+
 /// Parse a `KEY=VALUE` pair
 ///
 /// # Errors
@@ -179,6 +183,177 @@ async fn patch_env(api: &Api<FractalService>, service: &str, env: &[EnvVar]) -> 
     Ok(())
 }
 
+/// Merge `new` into the env read from the API, replacing a same-named
+/// entry. Existing entries are normalized into valid mutation inputs, so
+/// referenced secrets round-trip as references, never plaintext.
+fn upsert_api_env(existing: &[model::EnvVar], new: model::EnvVar) -> Vec<model::EnvVar> {
+    let mut out: Vec<model::EnvVar> = existing
+        .iter()
+        .filter(|e| e.name != new.name)
+        .map(model::EnvVar::to_input)
+        .collect();
+    out.push(new);
+    out
+}
+
+/// Remove `name` from the env read from the API. `None` when it isn't set.
+fn remove_api_env(existing: &[model::EnvVar], name: &str) -> Option<Vec<model::EnvVar>> {
+    if !existing.iter().any(|e| e.name == name) {
+        return None;
+    }
+    Some(
+        existing
+            .iter()
+            .filter(|e| e.name != name)
+            .map(model::EnvVar::to_input)
+            .collect(),
+    )
+}
+
+/// `updateFractalService` input that replaces the service's env list
+fn env_update_input(project: &str, service: &str, env: &[model::EnvVar]) -> serde_json::Value {
+    serde_json::json!({
+        "input": { "project": project, "name": service, "deploy": { "env": env } }
+    })
+}
+
+async fn locate(project: Option<&str>, service: &str) -> Result<(api::ApiClient, Located)> {
+    let client = api::ApiClient::from_env()?;
+    let located = api::resolve::locate_service(&client, project, service).await?;
+    Ok((client, located))
+}
+
+async fn write_api_env(client: &api::ApiClient, at: &Located, env: &[model::EnvVar]) -> Result<()> {
+    let _: serde_json::Value = client
+        .graphql(
+            &model::update_service_mutation(),
+            env_update_input(&at.project, at.service.name(), env),
+        )
+        .await?;
+    Ok(())
+}
+
+/// List env vars over the hosted API. Referenced secrets are masked.
+///
+/// # Errors
+///
+/// Returns an error if the service can't be found or the API call fails.
+pub async fn list_env_api(project: Option<&str>, service: &str) -> Result<()> {
+    let (_, at) = locate(project, service).await?;
+    let envs = at.service.env();
+    if envs.is_empty() {
+        println!("No environment variables set for '{}'", service.cyan());
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:<12} {}",
+        "NAME".bold(),
+        "SOURCE".bold(),
+        "VALUE".bold()
+    );
+    for env in envs {
+        let (source, value) = env.display();
+        println!("{:<20} {:<12} {}", env.name, source, value);
+    }
+    Ok(())
+}
+
+/// Set an env var over the hosted API. With `secret`, the value is sent
+/// write-only and stored as a managed secret reference.
+///
+/// # Errors
+///
+/// Returns an error if the pair is malformed, the service can't be
+/// found, or the update fails.
+pub async fn set_env_api(
+    project: Option<&str>,
+    service: &str,
+    pair: &str,
+    secret: bool,
+) -> Result<()> {
+    let (key, value) = parse_key_value(pair)?;
+    let (client, at) = locate(project, service).await?;
+    let new = if secret {
+        model::EnvVar {
+            name: key.clone(),
+            secret: Some(value),
+            ..model::EnvVar::default()
+        }
+    } else {
+        model::EnvVar {
+            name: key.clone(),
+            value: Some(value),
+            ..model::EnvVar::default()
+        }
+    };
+    let updated = upsert_api_env(at.service.env(), new);
+    write_api_env(&client, &at, &updated).await?;
+    println!(
+        "{} Set '{}'{} on '{}'",
+        "\u{2713}".green(),
+        key.cyan(),
+        if secret { " (secret)" } else { "" },
+        service.cyan()
+    );
+    Ok(())
+}
+
+/// Reference an existing secret from an env var over the hosted API
+///
+/// # Errors
+///
+/// Returns an error if the service can't be found or the update fails.
+pub async fn set_secret_env_api(
+    project: Option<&str>,
+    service: &str,
+    name: &str,
+    secret: &str,
+    key: &str,
+) -> Result<()> {
+    let (client, at) = locate(project, service).await?;
+    let new = model::EnvVar {
+        name: name.to_string(),
+        value_from: Some(model::EnvVarSource {
+            secret_ref: Some(model::SecretRef {
+                name: secret.to_string(),
+                key: key.to_string(),
+            }),
+            object_storage_ref: None,
+        }),
+        ..model::EnvVar::default()
+    };
+    let updated = upsert_api_env(at.service.env(), new);
+    write_api_env(&client, &at, &updated).await?;
+    println!(
+        "{} Set '{}' (secret ref) on '{}'",
+        "\u{2713}".green(),
+        name.cyan(),
+        service.cyan()
+    );
+    Ok(())
+}
+
+/// Remove an env var over the hosted API
+///
+/// # Errors
+///
+/// Returns an error if the service can't be found or the update fails.
+pub async fn unset_env_api(project: Option<&str>, service: &str, name: &str) -> Result<()> {
+    let (client, at) = locate(project, service).await?;
+    let Some(updated) = remove_api_env(at.service.env(), name) else {
+        println!("'{}' is not set on '{}'", name.cyan(), service.cyan());
+        return Ok(());
+    };
+    write_api_env(&client, &at, &updated).await?;
+    println!(
+        "{} Unset '{}' on '{}'",
+        "\u{2713}".green(),
+        name.cyan(),
+        service.cyan()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +439,57 @@ mod tests {
         // Removing non-existent key is a no-op
         let result = remove_env(&envs, "NONEXISTENT");
         assert_eq!(result.len(), 2);
+    }
+
+    fn api_env() -> Vec<model::EnvVar> {
+        let d: model::ServicesData =
+            crate::api::parse_graphql(200, model::fixtures::SERVICES_JSON).unwrap();
+        d.fractal_services[0].env().to_vec()
+    }
+
+    #[test]
+    fn api_upsert_replaces_and_keeps_references() {
+        let new = model::EnvVar {
+            name: "PORT".to_string(),
+            value: Some("8080".to_string()),
+            ..model::EnvVar::default()
+        };
+        let out = upsert_api_env(&api_env(), new);
+        let input = env_update_input("demo", "web", &out);
+        assert_eq!(input["input"]["project"], "demo");
+        assert_eq!(input["input"]["name"], "web");
+        let env = input["input"]["deploy"]["env"].as_array().unwrap();
+        assert_eq!(env.len(), 3);
+        assert_eq!(
+            env[0],
+            serde_json::json!({ "name": "DB_PASSWORD", "valueFrom": { "secretRef": { "name": "web-env", "key": "DB_PASSWORD" } } })
+        );
+        assert_eq!(
+            env[2],
+            serde_json::json!({ "name": "PORT", "value": "8080" })
+        );
+    }
+
+    #[test]
+    fn api_upsert_sends_secret_write_only() {
+        let new = model::EnvVar {
+            name: "API_KEY".to_string(),
+            secret: Some("s3cr3t".to_string()),
+            ..model::EnvVar::default()
+        };
+        let out = upsert_api_env(&api_env(), new);
+        let last = serde_json::to_value(out.last().unwrap()).unwrap();
+        assert_eq!(
+            last,
+            serde_json::json!({ "name": "API_KEY", "secret": "s3cr3t" })
+        );
+    }
+
+    #[test]
+    fn api_remove_drops_only_named_var() {
+        let out = remove_api_env(&api_env(), "PORT").unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|e| e.name != "PORT"));
+        assert!(remove_api_env(&api_env(), "MISSING").is_none());
     }
 }

@@ -8,6 +8,12 @@ use rand::rngs::OsRng;
 
 use fractal_operator::crd::api_token::{FractalApiToken, FractalApiTokenSpec, hash_token};
 
+use crate::api;
+use crate::api::model::{
+    CreateTokenData, Project, RevokeTokenData, TokenInfo, TokensData, create_token_mutation,
+    list_tokens_query, revoke_token_mutation,
+};
+
 /// Namespace where tokens live. Tokens are workspace-scoped, not
 /// project-scoped, so they all land in a single namespace per workspace.
 const TOKENS_NS: &str = "fractal-system";
@@ -265,6 +271,216 @@ fn is_expired(expires_at: Option<&String>) -> bool {
     chrono::DateTime::parse_from_rfc3339(s).is_ok_and(|t| t < Utc::now())
 }
 
+/// Default `--subject` value; the only one the hosted API accepts,
+/// because hosted tokens always act as the person who mints them
+pub const DEFAULT_SUBJECT: &str = "service-account";
+
+/// Pick the workspace for token commands: `--workspace`, then
+/// `FRACTAL_WORKSPACE`, then the single workspace that owns every
+/// project you can see
+fn infer_workspace(
+    explicit: Option<&str>,
+    env: Option<&str>,
+    projects: &[Project],
+) -> Result<String> {
+    if let Some(w) = explicit.or(env).map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(w.to_string());
+    }
+    let mut ids: Vec<&str> = projects
+        .iter()
+        .filter_map(|p| p.spec.organization_id.as_deref())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    match ids.as_slice() {
+        [one] => Ok((*one).to_string()),
+        [] => anyhow::bail!(
+            "couldn't determine your workspace from your projects; pass --workspace <id>"
+        ),
+        many => anyhow::bail!(
+            "you belong to more than one workspace ({}); pass --workspace <id>",
+            many.join(", ")
+        ),
+    }
+}
+
+async fn resolve_workspace(client: &api::ApiClient, explicit: Option<&str>) -> Result<String> {
+    let env = std::env::var("FRACTAL_WORKSPACE").ok();
+    if explicit.is_some() || env.as_deref().is_some_and(|e| !e.trim().is_empty()) {
+        return infer_workspace(explicit, env.as_deref(), &[]);
+    }
+    let projects = api::resolve::list_projects(client).await?;
+    infer_workspace(None, None, &projects)
+}
+
+/// Status label for a token read from the API
+fn api_token_status(tok: &TokenInfo) -> &'static str {
+    if tok.revoked_at.is_some() {
+        "revoked"
+    } else if is_expired(tok.expires_at.as_ref()) {
+        "expired"
+    } else {
+        "active"
+    }
+}
+
+/// Pick the newest active token with `label`
+fn newest_active<'a>(tokens: &'a [TokenInfo], label: &str) -> Option<&'a TokenInfo> {
+    tokens
+        .iter()
+        .filter(|t| t.name == label && t.revoked_at.is_none())
+        .max_by(|a, b| a.issued_at.cmp(&b.issued_at))
+}
+
+async fn fetch_api_tokens(client: &api::ApiClient, workspace: &str) -> Result<Vec<TokenInfo>> {
+    let data: TokensData = client
+        .graphql(
+            &list_tokens_query(),
+            serde_json::json!({ "organizationId": workspace }),
+        )
+        .await?;
+    Ok(data.fractal_api_tokens)
+}
+
+/// List the workspace's API tokens over the hosted API. Secrets are
+/// never returned.
+///
+/// # Errors
+///
+/// Returns an error if the workspace can't be determined or the API call
+/// fails.
+pub async fn list_tokens_api(workspace: Option<&str>) -> Result<()> {
+    let client = api::ApiClient::from_env()?;
+    let workspace = resolve_workspace(&client, workspace).await?;
+    let tokens = fetch_api_tokens(&client, &workspace).await?;
+
+    if tokens.is_empty() {
+        println!("{}", "(no tokens)".dimmed());
+        return Ok(());
+    }
+    println!(
+        "{:<24}  {:<24}  {:<16}  {}",
+        "NAME".bold(),
+        "SUBJECT".bold(),
+        "EXPIRES".bold(),
+        "STATUS".bold()
+    );
+    for tok in &tokens {
+        let status = match api_token_status(tok) {
+            "revoked" => "revoked".red().to_string(),
+            "expired" => "expired".yellow().to_string(),
+            other => other.green().to_string(),
+        };
+        let expires = tok.expires_at.as_deref().unwrap_or("never");
+        let last_used = tok
+            .last_used_at
+            .as_deref()
+            .unwrap_or("never")
+            .dimmed()
+            .to_string();
+        println!(
+            "{:<24}  {:<24}  {:<16}  {}  (last used {})",
+            tok.name.cyan(),
+            tok.subject,
+            expires.yellow(),
+            status,
+            last_used,
+        );
+    }
+    Ok(())
+}
+
+/// Mint a token over the hosted API, printing the plaintext once
+///
+/// # Errors
+///
+/// Returns an error if `subject` is set (hosted tokens always act as
+/// you), the workspace can't be determined, or the mutation fails.
+pub async fn create_token_api(
+    label: &str,
+    subject: &str,
+    scopes: Vec<String>,
+    expires_in_days: Option<i64>,
+    workspace: Option<&str>,
+) -> Result<()> {
+    if subject != DEFAULT_SUBJECT {
+        anyhow::bail!(
+            "--subject isn't supported for hosted workspaces; a token always acts as the person who creates it"
+        );
+    }
+    let client = api::ApiClient::from_env()?;
+    let workspace = resolve_workspace(&client, workspace).await?;
+    let mut input = serde_json::json!({ "name": label, "organizationId": workspace });
+    if !scopes.is_empty() {
+        input["scopes"] = serde_json::json!(scopes);
+    }
+    if let Some(days) = expires_in_days {
+        input["expiresInDays"] = serde_json::json!(days);
+    }
+    let data: CreateTokenData = client
+        .graphql(
+            &create_token_mutation(),
+            serde_json::json!({ "input": input }),
+        )
+        .await?;
+    let created = data.create_fractal_api_token;
+
+    println!("{} token {} created", "\u{2713}".green(), label.cyan());
+    println!(
+        "  {} {}",
+        "Scopes:".bold(),
+        created.info.scopes.join(", ").dimmed()
+    );
+    println!(
+        "  {} {}",
+        "Expires:".bold(),
+        created
+            .info
+            .expires_at
+            .as_deref()
+            .unwrap_or("never")
+            .yellow()
+    );
+    println!();
+    println!(
+        "{} {}",
+        "Token (copy now -- it will not be shown again):"
+            .bold()
+            .red(),
+        created.token.cyan()
+    );
+    Ok(())
+}
+
+/// Revoke the newest active token with `label` over the hosted API
+///
+/// # Errors
+///
+/// Returns an error if no active token matches or the mutation fails.
+pub async fn revoke_token_api(label: &str, workspace: Option<&str>) -> Result<()> {
+    let client = api::ApiClient::from_env()?;
+    let workspace = resolve_workspace(&client, workspace).await?;
+    let tokens = fetch_api_tokens(&client, &workspace).await?;
+    let target = newest_active(&tokens, label)
+        .with_context(|| format!("no active token found with label '{label}'"))?;
+    let data: RevokeTokenData = client
+        .graphql(
+            &revoke_token_mutation(),
+            serde_json::json!({ "input": { "id": target.id } }),
+        )
+        .await?;
+    let revoked = data.revoke_fractal_api_token;
+    println!(
+        "{} token {} revoked ({}, at {})",
+        "\u{2713}".green(),
+        label.cyan(),
+        revoked.id.dimmed(),
+        revoked.revoked_at.as_deref().unwrap_or("now").dimmed()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,7 +493,7 @@ mod tests {
         assert!(suffix.len() >= 50, "got {} chars", suffix.len());
         for c in suffix.chars() {
             assert!(
-                ('a'..='z').contains(&c) || ('2'..='7').contains(&c),
+                c.is_ascii_lowercase() || ('2'..='7').contains(&c),
                 "non-base32 char in {t}: {c}",
             );
         }
@@ -320,5 +536,74 @@ mod tests {
         // accidentally revoking a token because of a parsing edge case.
         let s = "not-a-date".to_string();
         assert!(!is_expired(Some(&s)));
+    }
+
+    fn project_in(org: Option<&str>) -> Project {
+        let mut p = Project::default();
+        p.spec.organization_id = org.map(str::to_string);
+        p
+    }
+
+    #[test]
+    fn workspace_flag_then_env_then_inference() {
+        assert_eq!(
+            infer_workspace(Some("org_f"), Some("org_e"), &[]).unwrap(),
+            "org_f"
+        );
+        assert_eq!(infer_workspace(None, Some("org_e"), &[]).unwrap(), "org_e");
+        let projects = [
+            project_in(Some("org_1")),
+            project_in(Some("org_1")),
+            project_in(None),
+        ];
+        assert_eq!(infer_workspace(None, None, &projects).unwrap(), "org_1");
+    }
+
+    #[test]
+    fn workspace_inference_fails_when_ambiguous_or_empty() {
+        let err = infer_workspace(None, None, &[project_in(Some("a")), project_in(Some("b"))])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("(a, b)") && err.contains("--workspace"));
+        let err = infer_workspace(None, None, &[project_in(None)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--workspace"));
+    }
+
+    fn tok(name: &str, issued: &str, revoked: bool, expires: Option<&str>) -> TokenInfo {
+        TokenInfo {
+            id: format!("{name}-{issued}"),
+            name: name.to_string(),
+            issued_at: issued.to_string(),
+            revoked_at: revoked.then(|| "2026-01-01T00:00:00Z".to_string()),
+            expires_at: expires.map(str::to_string),
+            ..TokenInfo::default()
+        }
+    }
+
+    #[test]
+    fn newest_active_skips_revoked_and_other_labels() {
+        let tokens = [
+            tok("ci", "2026-01-01T00:00:00Z", false, None),
+            tok("ci", "2026-03-01T00:00:00Z", true, None),
+            tok("ci", "2026-02-01T00:00:00Z", false, None),
+            tok("other", "2026-04-01T00:00:00Z", false, None),
+        ];
+        assert_eq!(
+            newest_active(&tokens, "ci").unwrap().id,
+            "ci-2026-02-01T00:00:00Z"
+        );
+        assert!(newest_active(&tokens, "missing").is_none());
+    }
+
+    #[test]
+    fn api_token_status_labels() {
+        assert_eq!(api_token_status(&tok("a", "x", true, None)), "revoked");
+        assert_eq!(
+            api_token_status(&tok("a", "x", false, Some("2000-01-01T00:00:00Z"))),
+            "expired"
+        );
+        assert_eq!(api_token_status(&tok("a", "x", false, None)), "active");
     }
 }
