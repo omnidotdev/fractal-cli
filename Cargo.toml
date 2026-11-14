@@ -34,6 +34,10 @@ rand = "0.9"
 # reqwest's default-tls (which pulls aws-lc-sys via hyper-rustls and
 # bites us with rustc ICEs at build time, see operator's same pattern.)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+# The operator dependency enables both rustls backends (ring via kube,
+# aws-lc-rs via the AWS SDK), so rustls cannot pick one on its own; main
+# installs ring explicitly, matching the operator
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -511,6 +511,10 @@ enum EnvCommands {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Both rustls backends are compiled in, so pick one before any TLS use
+    // (the kube client panics otherwise). Fails only if one is already set
+    let _ = rustls::crypto::ring::default_provider().install_default();
     workspace::set_flag(cli.workspace.clone());
 
     let rt = match tokio::runtime::Runtime::new() {
