@@ -41,7 +41,7 @@ struct ServiceRow {
 
 /// Human/JSON label for a service type, matching the CRD's camelCase
 /// serialization so the two never diverge.
-const fn service_type_label(service_type: &ServiceType) -> &'static str {
+pub const fn service_type_label(service_type: &ServiceType) -> &'static str {
     match service_type {
         ServiceType::Web => "web",
         ServiceType::Worker => "worker",

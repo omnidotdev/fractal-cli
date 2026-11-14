@@ -35,7 +35,7 @@ struct LogStreamMeta {
 /// One log line as an NDJSON object under `--json`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct LogLine<'a> {
+pub struct LogLine<'a> {
     pod: &'a str,
     message: &'a str,
 }
@@ -191,7 +191,7 @@ pub struct LogOptions<'a> {
 }
 
 /// How often `--follow` polls the API
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Extra seconds of overlap on every poll so no line falls between two
 /// windows; duplicates are dropped by timestamp
@@ -201,25 +201,25 @@ const POLL_OVERLAP_SECS: i64 = 5;
 const MAX_POLL_FAILURES: u32 = 5;
 
 /// `GET /v1/services/logs` reply
-#[derive(Debug, Deserialize)]
-struct LogsReply {
+#[derive(Debug, Default, Deserialize)]
+pub struct LogsReply {
     #[serde(default)]
-    namespace: String,
+    pub namespace: String,
     #[serde(default)]
-    pods: Vec<PodLog>,
+    pub pods: Vec<PodLog>,
 }
 
 #[derive(Debug, Deserialize)]
-struct PodLog {
-    name: String,
+pub struct PodLog {
+    pub name: String,
     #[serde(default)]
-    container: Option<String>,
+    pub container: Option<String>,
     #[serde(default)]
-    log: Option<String>,
+    pub log: Option<String>,
 }
 
 /// Query parameters for one logs request
-fn log_query(
+pub fn log_query(
     namespace: &str,
     project: &str,
     service: &str,
@@ -260,7 +260,7 @@ fn split_timestamp(line: &str) -> (Option<DateTime<FixedOffset>>, &str) {
 /// Drops lines already printed by an earlier, overlapping poll. Tracks
 /// the newest timestamp per pod/container plus the lines seen at it.
 #[derive(Default)]
-struct Dedup {
+pub struct Dedup {
     seen: HashMap<String, (DateTime<FixedOffset>, HashSet<String>)>,
 }
 
@@ -290,14 +290,14 @@ impl Dedup {
 
 /// A line ready to print
 #[derive(Debug, PartialEq, Eq)]
-struct Rendered {
-    pod: String,
-    message: String,
+pub struct Rendered {
+    pub pod: String,
+    pub message: String,
 }
 
 /// Turn one reply into the lines to print, applying dedupe, grep, and
 /// timestamp stripping
-fn render_reply(
+pub fn render_reply(
     reply: &LogsReply,
     dedup: &mut Dedup,
     grep: Option<&str>,
@@ -341,7 +341,7 @@ fn render_reply(
     out
 }
 
-fn print_rendered(lines: &[Rendered], json: bool) {
+pub fn print_rendered(lines: &[Rendered], json: bool) {
     for line in lines {
         if json {
             match serde_json::to_string(&LogLine {
@@ -359,7 +359,7 @@ fn print_rendered(lines: &[Rendered], json: bool) {
 
 /// Seconds of history to request on the next poll: the time since the
 /// previous request, plus overlap
-fn poll_window(elapsed: Duration) -> i64 {
+pub fn poll_window(elapsed: Duration) -> i64 {
     let secs = i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX / 2);
     secs.saturating_add(1).saturating_add(POLL_OVERLAP_SECS)
 }
