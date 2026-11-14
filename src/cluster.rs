@@ -48,14 +48,26 @@ struct ListedInstallTokensResponse {
 /// Build a reqwest client and resolve the API URL + token, using the
 /// same precedence as every other API-backed command: `FRACTAL_API_TOKEN`,
 /// then `FRACTAL_AUTH_TOKEN`, then the saved login (refreshed first when
-/// it is about to expire)
-async fn api_session() -> Result<(String, String, reqwest::Client)> {
+/// it is about to expire), plus the workspace header a browser login
+/// sends
+async fn api_session() -> Result<(String, String, reqwest::Client, Option<String>)> {
     let base = crate::api::api_url();
-    let token = crate::api::ApiClient::from_env()?.bearer_token().await?;
+    let api = crate::api::ApiClient::from_env()?;
+    let token = api.bearer_token().await?;
+    let workspace = api.workspace_header().await?;
     let client = reqwest::Client::builder()
         .build()
         .context("failed to build HTTP client")?;
-    Ok((base, token, client))
+    Ok((base, token, client, workspace))
+}
+
+/// The `X-Fractal-Workspace` header for a browser login, else nothing
+fn workspace_headers(workspace: Option<&str>) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(value) = workspace.and_then(|w| reqwest::header::HeaderValue::from_str(w).ok()) {
+        headers.insert(crate::workspace::WORKSPACE_HEADER, value);
+    }
+    headers
 }
 
 /// Mint a per-cluster install token from the Fractal API.
@@ -65,11 +77,12 @@ async fn api_session() -> Result<(String, String, reqwest::Client)> {
 /// Returns an error if no credential is configured, the HTTP call
 /// fails, or the server returns a non-2xx status.
 async fn mint_install_token(cluster_name: Option<&str>) -> Result<MintTokenResponse> {
-    let (base, token, client) = api_session().await?;
+    let (base, token, client, workspace) = api_session().await?;
     let url = format!("{}/v1/clusters/install-tokens", base.trim_end_matches('/'));
     let resp = client
         .post(&url)
         .bearer_auth(&token)
+        .headers(workspace_headers(workspace.as_deref()))
         .json(&MintTokenRequest { cluster_name })
         .send()
         .await
@@ -102,11 +115,12 @@ async fn mint_install_token(cluster_name: Option<&str>) -> Result<MintTokenRespo
 /// Returns an error if no credential is configured, the HTTP call
 /// fails, or the server returns a non-2xx status.
 pub async fn list_tokens() -> Result<()> {
-    let (base, token, client) = api_session().await?;
+    let (base, token, client, workspace) = api_session().await?;
     let url = format!("{}/v1/clusters/install-tokens", base.trim_end_matches('/'));
     let resp = client
         .get(&url)
         .bearer_auth(&token)
+        .headers(workspace_headers(workspace.as_deref()))
         .send()
         .await
         .with_context(|| format!("GET {url} failed"))?;
@@ -170,7 +184,7 @@ pub async fn list_tokens() -> Result<()> {
 /// Returns an error if no credential is configured, the HTTP call
 /// fails, or the server returns a non-2xx status.
 pub async fn revoke_token(id: &str) -> Result<()> {
-    let (base, token, client) = api_session().await?;
+    let (base, token, client, workspace) = api_session().await?;
     let url = format!(
         "{}/v1/clusters/install-tokens/{}",
         base.trim_end_matches('/'),
@@ -179,6 +193,7 @@ pub async fn revoke_token(id: &str) -> Result<()> {
     let resp = client
         .delete(&url)
         .bearer_auth(&token)
+        .headers(workspace_headers(workspace.as_deref()))
         .send()
         .await
         .with_context(|| format!("DELETE {url} failed"))?;
@@ -571,6 +586,7 @@ mod tests {
                 access_token: Some("at".to_string()),
                 ..AuthConfig::default()
             },
+            ..Config::default()
         }
         .save_to(&path)
         .unwrap();

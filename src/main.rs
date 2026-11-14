@@ -21,6 +21,7 @@ mod secrets_sync;
 mod services;
 mod tokens;
 mod transport;
+mod workspace;
 
 use std::process::ExitCode;
 
@@ -54,6 +55,11 @@ struct Cli {
     /// the service is looked up across your projects.
     #[arg(long, global = true)]
     project: Option<String>,
+    /// Workspace (slug or id) to act in. Overrides `FRACTAL_WORKSPACE`
+    /// and the workspace saved by `fractal login` or
+    /// `fractal workspace use`
+    #[arg(long, global = true)]
+    workspace: Option<String>,
 }
 
 /// Global options every dispatcher needs
@@ -201,6 +207,11 @@ enum Commands {
     Logout,
     /// Print the currently logged-in identity
     Whoami,
+    /// List, select, or show the workspace a browser login acts in
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceCommands,
+    },
     /// Authenticate with the Fractal control plane
     Auth {
         #[command(subcommand)]
@@ -251,6 +262,19 @@ enum Commands {
         #[arg(long)]
         env: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommands {
+    /// List your workspaces, marking the one commands act in
+    List,
+    /// Act in a workspace from now on (saved to the config file)
+    Use {
+        /// Workspace slug or id
+        workspace: String,
+    },
+    /// Show the workspace commands act in
+    Current,
 }
 
 #[derive(Subcommand)]
@@ -320,17 +344,16 @@ struct LoginArgs {
     /// display
     #[arg(long)]
     no_browser: bool,
+    /// Sign in again instead of approving the account already signed
+    /// in to the browser
+    #[arg(long, conflicts_with = "token")]
+    switch_account: bool,
 }
 
 #[derive(Subcommand)]
 enum TokensCommands {
     /// List tokens in the current workspace
-    List {
-        /// Workspace id (api transport). Falls back to
-        /// `FRACTAL_WORKSPACE`, then the workspace that owns your projects
-        #[arg(long)]
-        workspace: Option<String>,
-    },
+    List,
     /// Mint a new token. The plaintext is printed once; only its hash is stored.
     Create {
         /// Human-readable label (e.g. "github-actions-ci")
@@ -347,19 +370,11 @@ enum TokensCommands {
         /// Token lifetime in days. Omit for never-expires.
         #[arg(long)]
         expires_in_days: Option<i64>,
-        /// Workspace id (api transport). Falls back to
-        /// `FRACTAL_WORKSPACE`, then the workspace that owns your projects
-        #[arg(long)]
-        workspace: Option<String>,
     },
     /// Revoke a token (kept for audit)
     Revoke {
         /// Token label
         name: String,
-        /// Workspace id (api transport). Falls back to
-        /// `FRACTAL_WORKSPACE`, then the workspace that owns your projects
-        #[arg(long)]
-        workspace: Option<String>,
     },
     /// Permanently delete a token CR (audit trail goes with it; prefer revoke)
     Delete {
@@ -496,6 +511,7 @@ enum EnvCommands {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    workspace::set_flag(cli.workspace.clone());
 
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -625,6 +641,7 @@ fn dispatch(command: Commands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
         Commands::Login { args } => dispatch_auth(AuthCommands::Login { args }, ctx),
         Commands::Logout => dispatch_auth(AuthCommands::Logout, ctx),
         Commands::Whoami => dispatch_auth(AuthCommands::Whoami, ctx),
+        Commands::Workspace { action } => dispatch_workspace(action, ctx),
         Commands::Auth { action } => dispatch_auth(action, ctx),
         Commands::Deploy {
             namespace,
@@ -791,12 +808,25 @@ fn dispatch_cluster(action: ClusterCommands, rt: &tokio::runtime::Runtime) -> an
 /// `fractal login | logout | whoami`, also reachable under `fractal auth`
 fn dispatch_auth(action: AuthCommands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
     match action {
-        AuthCommands::Login { args } => {
-            ctx.rt
-                .block_on(auth::login(ctx.json, args.token, args.no_browser))
-        }
+        AuthCommands::Login { args } => ctx.rt.block_on(auth::login(
+            ctx.json,
+            args.token,
+            args.no_browser,
+            args.switch_account,
+        )),
         AuthCommands::Logout => ctx.rt.block_on(auth::logout()),
         AuthCommands::Whoami => ctx.rt.block_on(auth::whoami(ctx.json, ctx.transport()?)),
+    }
+}
+
+/// `fractal workspace list | use | current`
+fn dispatch_workspace(action: WorkspaceCommands, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    match action {
+        WorkspaceCommands::List => ctx.rt.block_on(workspace::list(ctx.json)),
+        WorkspaceCommands::Use { workspace: wanted } => {
+            ctx.rt.block_on(workspace::use_workspace(&wanted, ctx.json))
+        }
+        WorkspaceCommands::Current => ctx.rt.block_on(workspace::current(ctx.json)),
     }
 }
 
@@ -804,43 +834,36 @@ fn dispatch_tokens(action: TokensCommands, ctx: &Ctx<'_>) -> anyhow::Result<()> 
     let rt = ctx.rt;
     if ctx.is_api()? {
         return match action {
-            TokensCommands::List { workspace } => {
-                rt.block_on(tokens::list_tokens_api(workspace.as_deref()))
-            }
+            TokensCommands::List => rt.block_on(tokens::list_tokens_api()),
             TokensCommands::Create {
                 name,
                 subject,
                 scopes,
                 expires_in_days,
-                workspace,
             } => rt.block_on(tokens::create_token_api(
                 &name,
                 &subject,
                 scopes,
                 expires_in_days,
-                workspace.as_deref(),
             )),
-            TokensCommands::Revoke { name, workspace } => {
-                rt.block_on(tokens::revoke_token_api(&name, workspace.as_deref()))
-            }
+            TokensCommands::Revoke { name } => rt.block_on(tokens::revoke_token_api(&name)),
             TokensCommands::Delete { .. } => unreachable!("handled by hosted_gap"),
         };
     }
     match action {
-        TokensCommands::List { .. } => rt.block_on(tokens::list_tokens()),
+        TokensCommands::List => rt.block_on(tokens::list_tokens()),
         TokensCommands::Create {
             name,
             subject,
             scopes,
             expires_in_days,
-            ..
         } => rt.block_on(tokens::create_token(
             &name,
             &subject,
             scopes,
             expires_in_days,
         )),
-        TokensCommands::Revoke { name, .. } => rt.block_on(tokens::revoke_token(&name)),
+        TokensCommands::Revoke { name } => rt.block_on(tokens::revoke_token(&name)),
         TokensCommands::Delete { name } => rt.block_on(tokens::delete_token(&name)),
     }
 }
@@ -964,6 +987,51 @@ mod tests {
                 .command,
             super::Commands::Whoami
         ));
+    }
+
+    #[test]
+    fn login_switch_account_parses_and_conflicts_with_token() {
+        let cli = Cli::try_parse_from(["fractal", "login", "--switch-account"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Commands::Login { ref args } if args.switch_account && args.token.is_none()
+        ));
+        assert!(
+            Cli::try_parse_from(["fractal", "login", "--switch-account", "--token", "x"]).is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_commands_and_global_flag_parse() {
+        let cli = Cli::try_parse_from(["fractal", "workspace", "use", "omni"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Commands::Workspace {
+                action: super::WorkspaceCommands::Use { ref workspace }
+            } if workspace == "omni"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["fractal", "workspace", "list", "--json"])
+                .unwrap()
+                .command,
+            super::Commands::Workspace {
+                action: super::WorkspaceCommands::List
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["fractal", "workspace", "current"])
+                .unwrap()
+                .command,
+            super::Commands::Workspace {
+                action: super::WorkspaceCommands::Current
+            }
+        ));
+        // The global flag still works where `tokens` took its own
+        let cli =
+            Cli::try_parse_from(["fractal", "tokens", "list", "--workspace", "omni"]).unwrap();
+        assert_eq!(cli.workspace.as_deref(), Some("omni"));
+        let cli = Cli::try_parse_from(["fractal", "--workspace", "acme", "services"]).unwrap();
+        assert_eq!(cli.workspace.as_deref(), Some("acme"));
     }
 
     #[test]

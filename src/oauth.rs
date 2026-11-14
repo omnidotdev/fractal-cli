@@ -188,6 +188,30 @@ pub fn redirect_uri_for(port: u16) -> String {
     format!("http://127.0.0.1:{port}{CALLBACK_PATH}")
 }
 
+/// The OIDC `prompt` sent on the authorization request
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prompt {
+    /// Always show the "Authorize Fractal CLI" page naming the signed-in
+    /// account, instead of silently reusing the browser session. The
+    /// standard flow for a command-line login, so the person sees which
+    /// account the CLI is about to act as
+    Consent,
+    /// Force a fresh sign-in, then still show the consent page
+    /// (`fractal login --switch-account`). `login` alone would let a
+    /// trusted client receive a code without the consent page
+    Login,
+}
+
+impl Prompt {
+    /// The `prompt` parameter value (OIDC Core 3.1.2.1)
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Consent => "consent",
+            Self::Login => "login consent",
+        }
+    }
+}
+
 /// Build the authorization URL the browser opens
 ///
 /// # Errors
@@ -199,6 +223,7 @@ pub fn authorize_url(
     redirect_uri: &str,
     state: &str,
     challenge: &str,
+    prompt: Prompt,
 ) -> Result<Url> {
     Url::parse_with_params(
         endpoint,
@@ -210,6 +235,7 @@ pub fn authorize_url(
             ("state", state),
             ("code_challenge", challenge),
             ("code_challenge_method", "S256"),
+            ("prompt", prompt.as_str()),
         ],
     )
     .context("the identity provider advertised an invalid authorization endpoint")
@@ -746,13 +772,14 @@ pub fn claim_str(claims: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// A workspace the caller belongs to
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// A workspace the caller belongs to. Also the shape `fractal workspace
+/// use` saves to the config file
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slug: Option<String>,
 }
 
@@ -787,28 +814,6 @@ pub fn workspaces(claims: &Value) -> Vec<Workspace> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// The workspace commands act in: the one named by `FRACTAL_WORKSPACE`
-/// (matched by id or slug), else the only workspace the caller belongs
-/// to. `None` when the choice is ambiguous.
-pub fn active_workspace(env: Option<&str>, all: &[Workspace]) -> Option<Workspace> {
-    if let Some(wanted) = env.map(str::trim).filter(|s| !s.is_empty()) {
-        return Some(
-            all.iter()
-                .find(|w| w.id == wanted || w.slug.as_deref() == Some(wanted))
-                .cloned()
-                .unwrap_or_else(|| Workspace {
-                    id: wanted.to_string(),
-                    name: None,
-                    slug: None,
-                }),
-        );
-    }
-    match all {
-        [one] => Some(one.clone()),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -852,6 +857,7 @@ mod tests {
             "http://127.0.0.1:5555/callback",
             "st",
             "ch",
+            Prompt::Consent,
         )
         .unwrap();
         let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
@@ -862,6 +868,32 @@ mod tests {
         assert_eq!(q["state"], "st");
         assert_eq!(q["code_challenge"], "ch");
         assert_eq!(q["code_challenge_method"], "S256");
+        assert_eq!(q["prompt"], "consent");
+    }
+
+    #[test]
+    fn authorize_url_forces_a_fresh_sign_in_to_switch_accounts() {
+        let url = authorize_url(
+            "https://id.example.test/oauth2/authorize",
+            "cid",
+            "http://127.0.0.1:5555/callback",
+            "st",
+            "ch",
+            Prompt::Login,
+        )
+        .unwrap();
+        let prompts: Vec<_> = url
+            .query_pairs()
+            .filter(|(k, _)| k == "prompt")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(prompts, ["login consent"]);
+        // Space-separated per OIDC, URL-encoded on the wire
+        assert!(
+            url.as_str().contains("prompt=login+consent")
+                || url.as_str().contains("prompt=login%20consent"),
+            "{url}"
+        );
     }
 
     #[test]
@@ -1052,35 +1084,6 @@ mod tests {
         assert_eq!(ws[1].to_string(), "Beta (beta)");
         assert!(decode_jwt_claims("ftk_not_a_jwt").is_none());
         assert!(workspaces(&serde_json::json!({})).is_empty());
-    }
-
-    #[test]
-    fn active_workspace_prefers_env_then_sole_membership() {
-        let a = Workspace {
-            id: "org_a".to_string(),
-            name: Some("Alpha".to_string()),
-            slug: Some("alpha".to_string()),
-        };
-        let b = Workspace {
-            id: "org_b".to_string(),
-            name: None,
-            slug: None,
-        };
-        assert_eq!(
-            active_workspace(None, std::slice::from_ref(&a)),
-            Some(a.clone())
-        );
-        assert_eq!(active_workspace(None, &[a.clone(), b.clone()]), None);
-        assert_eq!(active_workspace(None, &[]), None);
-        assert_eq!(
-            active_workspace(Some("alpha"), &[a.clone(), b.clone()]),
-            Some(a.clone())
-        );
-        assert_eq!(
-            active_workspace(Some("org_b"), &[a.clone(), b.clone()]),
-            Some(b)
-        );
-        assert_eq!(active_workspace(Some("org_x"), &[a]).unwrap().id, "org_x");
     }
 
     #[test]

@@ -7,6 +7,13 @@
 //! command then refreshes the access token silently before it expires.
 //! `fractal login --token ftk_...` saves a Fractal API token instead.
 //!
+//! The authorization request always carries `prompt=consent`, so the
+//! browser shows an "Authorize Fractal CLI" page naming the signed-in
+//! account rather than silently reusing the session;
+//! `fractal login --switch-account` sends `prompt=login consent` to force
+//! a fresh sign-in that still ends on the consent page. After a browser login the CLI selects the workspace to act
+//! in (see [`crate::workspace`]).
+//!
 //! Commands resolve their credential through `crate::api::credential()`:
 //! `FRACTAL_API_TOKEN`, then the older `FRACTAL_AUTH_TOKEN`, then the
 //! saved login.
@@ -22,14 +29,12 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::api::{self, Credential, CredentialSource};
 use crate::config::{Config, TokenKind};
-use crate::oauth::{self, Pkce, TokenSet, Workspace};
+use crate::oauth::{self, Pkce, Prompt, TokenSet, Workspace};
 use crate::transport::Transport;
+use crate::workspace::{self, LoginChoice};
 
 /// How long `fractal login` waits for the browser
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-
-/// Env var naming the workspace commands act in
-const WORKSPACE_ENV: &str = "FRACTAL_WORKSPACE";
 
 /// Credential supplied out-of-band through `FRACTAL_API_TOKEN` or
 /// `FRACTAL_AUTH_TOKEN` (CI and automation). When present, an
@@ -61,10 +66,13 @@ struct WhoamiInfo {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_id: Option<String>,
-    /// Workspace commands act in (`FRACTAL_WORKSPACE`, else your only
-    /// workspace)
+    /// Workspace commands act in (`--workspace`, `FRACTAL_WORKSPACE`,
+    /// the saved workspace, else your only workspace)
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace: Option<Workspace>,
+    /// Where `workspace` came from
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_source: Option<workspace::Source>,
     /// Every workspace the browser login belongs to
     #[serde(skip_serializing_if = "Option::is_none")]
     workspaces: Option<Vec<Workspace>>,
@@ -98,7 +106,9 @@ fn credential_kind(cred: &Credential, cfg: &Config) -> Option<&'static str> {
 }
 
 /// Log in. With `--token`, save a Fractal API token; otherwise run the
-/// browser login.
+/// browser login and select the workspace to act in.
+/// `switch_account` forces a fresh sign-in instead of the consent page
+/// for the account already signed in to the browser.
 ///
 /// When `FRACTAL_API_TOKEN` (or `FRACTAL_AUTH_TOKEN`) is set, the login
 /// is skipped: the env token already authenticates every command. This
@@ -108,7 +118,12 @@ fn credential_kind(cred: &Credential, cfg: &Config) -> Option<&'static str> {
 ///
 /// Returns an error if the login fails, times out, or the config can't
 /// be written.
-pub async fn login(json: bool, token: Option<String>, no_browser: bool) -> Result<()> {
+pub async fn login(
+    json: bool,
+    token: Option<String>,
+    no_browser: bool,
+    switch_account: bool,
+) -> Result<()> {
     if let Some(token) = token {
         return login_with_token(json, &token).await;
     }
@@ -132,7 +147,12 @@ pub async fn login(json: bool, token: Option<String>, no_browser: bool) -> Resul
         return Ok(());
     }
 
-    let (tokens, id_claims) = browser_login(no_browser).await?;
+    let prompt = if switch_account {
+        Prompt::Login
+    } else {
+        Prompt::Consent
+    };
+    let (tokens, id_claims, leftover_lines) = browser_login(no_browser, prompt).await?;
     let claims = id_claims
         .or_else(|| oauth::decode_jwt_claims(&tokens.access_token))
         .unwrap_or(Value::Null);
@@ -148,6 +168,10 @@ pub async fn login(json: bool, token: Option<String>, no_browser: bool) -> Resul
     cfg.auth.name = oauth::claim_str(&claims, "name");
     cfg.save()?;
 
+    let memberships = select_login_workspace(&mut cfg, &claims, json, leftover_lines).await;
+    let several = memberships.len() > 1;
+    cfg.save()?;
+
     if json {
         println!(
             "{}",
@@ -158,6 +182,9 @@ pub async fn login(json: bool, token: Option<String>, no_browser: bool) -> Resul
                 email: cfg.auth.email.clone(),
                 name: cfg.auth.name.clone(),
                 user_id: cfg.auth.user_id.clone(),
+                workspace_source: cfg.workspace.as_ref().map(|_| workspace::Source::Saved),
+                workspace: cfg.workspace.clone(),
+                workspaces: Some(workspace::sorted(&memberships)),
                 ..WhoamiInfo::default()
             })?
         );
@@ -166,6 +193,11 @@ pub async fn login(json: bool, token: Option<String>, no_browser: bool) -> Resul
     match &cfg.auth.email {
         Some(email) => println!("{} Logged in as {}", "\u{2713}".green(), email.cyan()),
         None => println!("{} Logged in", "\u{2713}".green()),
+    }
+    match &cfg.workspace {
+        Some(w) => println!("  {} {}", "Workspace:".bold(), w.to_string().cyan()),
+        None if several => workspace::print_pick_hint(),
+        None => {}
     }
     if cfg.auth.refresh_token.is_none() {
         println!(
@@ -178,6 +210,41 @@ pub async fn login(json: bool, token: Option<String>, no_browser: bool) -> Resul
     Ok(())
 }
 
+/// Pick the workspace at the end of a browser login (see
+/// [`workspace::plan_login`]) and store it in `cfg`. Returns the login's
+/// workspaces. Userinfo carries workspace names and slugs; the ID
+/// token's claim is the fallback when it can't be reached.
+async fn select_login_workspace(
+    cfg: &mut Config,
+    claims: &Value,
+    json: bool,
+    leftover_lines: Option<UnboundedReceiver<String>>,
+) -> Vec<Workspace> {
+    let access = cfg.auth.access_token.clone().unwrap_or_default();
+    let memberships = match workspace::fetch_memberships(&access).await {
+        Ok(all) if !all.is_empty() => all,
+        _ => oauth::workspaces(claims),
+    };
+    let interactive = !json && workspace::interactive();
+    cfg.workspace = match workspace::plan_login(&memberships, cfg.workspace.as_ref(), interactive) {
+        LoginChoice::Nothing => None,
+        LoginChoice::Only(w) => Some(w),
+        LoginChoice::Pick { options, default } => {
+            // Reuse the paste login's stdin reader so it can't swallow the answer
+            let mut lines = leftover_lines.unwrap_or_else(oauth::spawn_line_reader);
+            match workspace::prompt_pick(&options, default, &mut lines).await {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    eprintln!("{} {e}", "Note:".yellow());
+                    None
+                }
+            }
+        }
+        LoginChoice::Hint { keep } => keep,
+    };
+    memberships
+}
+
 /// Wait for the next pasted line, or forever when not reading stdin
 async fn next_line(lines: &mut Option<UnboundedReceiver<String>>) -> Option<String> {
     match lines {
@@ -186,9 +253,13 @@ async fn next_line(lines: &mut Option<UnboundedReceiver<String>>) -> Option<Stri
     }
 }
 
+/// Tokens, the ID token's claims, and the stdin reader a paste login
+/// started (still reading, so later prompts must share it)
+type LoginResult = (TokenSet, Option<Value>, Option<UnboundedReceiver<String>>);
+
 /// Run the browser login and return the tokens plus the ID token's
 /// claims
-async fn browser_login(no_browser: bool) -> Result<(TokenSet, Option<Value>)> {
+async fn browser_login(no_browser: bool, prompt: Prompt) -> Result<LoginResult> {
     let http = oauth::http_client()?;
     let discovery = oauth::discover(&http, &oauth::auth_url()).await?;
     let client_id = oauth::client_id();
@@ -202,6 +273,7 @@ async fn browser_login(no_browser: bool) -> Result<(TokenSet, Option<Value>)> {
         &redirect_uri,
         &state,
         &pkce.challenge,
+        prompt,
     )?;
 
     let mut paste = !oauth::should_open_browser(no_browser, oauth::needs_display_server(), |k| {
@@ -288,6 +360,7 @@ async fn browser_login(no_browser: bool) -> Result<(TokenSet, Option<Value>)> {
     Ok((
         TokenSet::from_response(resp, oauth::unix_now(), None),
         id_claims,
+        lines,
     ))
 }
 
@@ -520,12 +593,14 @@ pub async fn whoami(json: bool, transport: Transport) -> Result<()> {
     };
     if let (true, Some(c)) = (is_oauth, &client) {
         let identity = oauth_identity(c, &cfg).await?;
-        let env = std::env::var(WORKSPACE_ENV).ok();
-        info.workspace = oauth::active_workspace(env.as_deref(), &identity.workspaces);
+        if let Some((w, source)) = active_workspace(&cfg, &identity.workspaces) {
+            info.workspace = Some(w);
+            info.workspace_source = Some(source);
+        }
         info.email = identity.email;
         info.name = identity.name;
         info.user_id = identity.user_id;
-        info.workspaces = Some(identity.workspaces);
+        info.workspaces = Some(workspace::sorted(&identity.workspaces));
     }
 
     if json {
@@ -534,6 +609,29 @@ pub async fn whoami(json: bool, transport: Transport) -> Result<()> {
     }
     print_whoami(&info, &cred);
     Ok(())
+}
+
+/// The workspace a browser login acts in, with its name and slug from
+/// `all`. A saved workspace is shown as saved when `all` couldn't be
+/// fetched.
+fn active_workspace(cfg: &Config, all: &[Workspace]) -> Option<(Workspace, workspace::Source)> {
+    let ids: Vec<String> = all.iter().map(|w| w.id.clone()).collect();
+    let req = workspace::requested(cfg, true, &ids)?;
+    if let Some(w) = workspace::find(&req.value, all) {
+        return Some((w.clone(), req.source));
+    }
+    if !all.is_empty() {
+        return None;
+    }
+    let fallback = match req.source {
+        workspace::Source::Saved => cfg.workspace.clone()?,
+        _ => Workspace {
+            id: req.value,
+            name: None,
+            slug: None,
+        },
+    };
+    Some((fallback, req.source))
 }
 
 fn print_whoami(info: &WhoamiInfo, cred: &Credential) {
@@ -557,18 +655,18 @@ fn print_whoami(info: &WhoamiInfo, cred: &Credential) {
         format!("via {via}").dimmed()
     );
     if let Some(ws) = &info.workspace {
-        println!("  {} {ws}", "Workspace:".bold());
-    } else if let Some(all) = info.workspaces.as_deref().filter(|w| !w.is_empty()) {
-        let list = all
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
+        let from = info
+            .workspace_source
+            .filter(|s| matches!(s, workspace::Source::Flag | workspace::Source::Env))
+            .map(|s| format!(" (from {})", s.label()).dimmed().to_string())
+            .unwrap_or_default();
         println!(
-            "  {} {list} {}",
-            "Workspaces:".bold(),
-            format!("(set {WORKSPACE_ENV} or pass --workspace to pick one)").dimmed()
+            "  {} {}{from}",
+            "Workspace:".bold(),
+            ws.to_string().cyan().bold()
         );
+    } else if info.workspaces.as_ref().is_some_and(|w| w.len() > 1) {
+        workspace::print_pick_hint();
     }
     println!(
         "  {} {}",

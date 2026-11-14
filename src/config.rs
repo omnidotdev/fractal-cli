@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::oauth::Workspace;
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
     /// Preferred transport (`api` or `kube`). Written as `kube` by
@@ -26,6 +28,12 @@ pub struct Config {
     pub api_url: Option<String>,
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Workspace a browser login acts in, picked at `fractal login` or
+    /// with `fractal workspace use`. Kept outside `auth` so a later
+    /// login can preselect it. `--workspace` and `FRACTAL_WORKSPACE`
+    /// override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Workspace>,
 }
 
 /// What kind of credential `access_token` holds
@@ -153,7 +161,8 @@ impl Config {
         Ok(())
     }
 
-    /// Forget every saved credential, keeping transport and API URL
+    /// Forget every saved credential, keeping transport, API URL, and
+    /// the saved workspace
     pub fn clear_auth(&mut self) {
         self.auth = AuthConfig::default();
     }
@@ -260,6 +269,25 @@ mod tests {
         assert!(cfg.auth.access_token.is_none());
         assert!(cfg.auth.refresh_token.is_none());
         assert_eq!(cfg.transport.as_deref(), Some("kube"));
+    }
+
+    #[test]
+    fn round_trips_the_saved_workspace_and_keeps_it_across_clear_auth() {
+        let mut cfg = Config {
+            workspace: Some(crate::oauth::Workspace {
+                id: "org_1".to_string(),
+                name: Some("Omni".to_string()),
+                slug: Some("omni".to_string()),
+            }),
+            ..Config::default()
+        };
+        cfg.auth.access_token = Some("at".to_string());
+        let out = toml::to_string(&cfg).unwrap();
+        let mut back: Config = toml::from_str(&out).unwrap();
+        assert_eq!(back.workspace, cfg.workspace);
+        back.clear_auth();
+        assert!(back.auth.access_token.is_none());
+        assert_eq!(back.workspace.unwrap().slug.as_deref(), Some("omni"));
     }
 
     #[test]
