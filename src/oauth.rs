@@ -52,7 +52,8 @@ pub const SCOPES: &str = "openid profile email offline_access organization";
 pub const ORGANIZATIONS_CLAIM: &str = "https://manifold.omni.dev/@omni/claims/organizations";
 
 /// Shown when a saved browser login can no longer be refreshed
-pub const SESSION_EXPIRED: &str = "Session expired, run `fractal login`";
+pub const SESSION_EXPIRED: &str =
+    "Your Fractal session expired. Run `fractal login` to sign in again.";
 
 /// Shown when the identity provider can't be reached to refresh
 pub const REFRESH_UNREACHABLE: &str = "could not reach the identity provider to refresh your session; check your connection and try again";
@@ -306,7 +307,9 @@ pub enum CallbackError {
     StateMismatch,
     /// The redirect names a different issuer (RFC 9207)
     IssuerMismatch,
-    /// The provider reported an error, e.g. the user denied access
+    /// The user chose Deny on the consent page (`access_denied`)
+    Canceled,
+    /// The provider reported any other error
     Denied(String),
     /// No authorization code in the redirect
     MissingCode,
@@ -321,6 +324,7 @@ impl fmt::Display for CallbackError {
             Self::IssuerMismatch => {
                 f.write_str("the sign-in response came from an unexpected identity provider")
             }
+            Self::Canceled => f.write_str("login canceled: access was denied in the browser"),
             Self::Denied(reason) => write!(f, "sign-in was not completed: {reason}"),
             Self::MissingCode => f.write_str("the sign-in response had no authorization code"),
         }
@@ -345,6 +349,9 @@ pub fn validate_callback(
         return Err(CallbackError::StateMismatch);
     }
     if let Some(error) = &params.error {
+        if error == "access_denied" {
+            return Err(CallbackError::Canceled);
+        }
         let reason = params
             .error_description
             .as_deref()
@@ -403,6 +410,9 @@ async fn read_request_target(stream: &mut TcpStream) -> Option<String> {
 /// Page shown in the browser once the CLI has its tokens
 const SUCCESS_PAGE: &str =
     "You're signed in to Fractal. You can close this tab and return to your terminal.";
+
+/// Page shown when the user chose Deny
+const CANCELED_PAGE: &str = "Login canceled. You can close this tab.";
 
 /// Page shown when the sign-in didn't complete
 const FAILURE_PAGE: &str = "Sign-in didn't complete. Return to your terminal for details.";
@@ -474,6 +484,10 @@ pub async fn await_redirect(
             Ok(code) => return Ok((code, stream)),
             Err(CallbackError::StateMismatch) => {
                 respond(&mut stream, "400 Bad Request", FAILURE_PAGE).await;
+            }
+            Err(CallbackError::Canceled) => {
+                respond(&mut stream, "200 OK", CANCELED_PAGE).await;
+                return Err(CallbackError::Canceled.into());
             }
             Err(e) => {
                 respond(&mut stream, "400 Bad Request", FAILURE_PAGE).await;
@@ -952,9 +966,17 @@ mod tests {
         };
         assert_eq!(
             validate_callback(&p, "s1", None),
-            Err(CallbackError::Denied(
-                "access_denied (User denied access)".to_string()
-            ))
+            Err(CallbackError::Canceled)
+        );
+        let p = CallbackParams {
+            error: Some("server_error".to_string()),
+            error_description: Some("boom".to_string()),
+            state: Some("s1".to_string()),
+            ..CallbackParams::default()
+        };
+        assert_eq!(
+            validate_callback(&p, "s1", None),
+            Err(CallbackError::Denied("server_error (boom)".to_string()))
         );
         assert_eq!(
             validate_callback(&params(None, Some("s1")), "s1", None),
@@ -1158,7 +1180,12 @@ mod tests {
             .await
             .unwrap();
         let err = waiter.await.unwrap().unwrap_err();
-        assert!(err.to_string().contains("access_denied"));
+        assert!(err.to_string().contains("login canceled"), "{err}");
+
+        // The browser tab is told the login was canceled
+        let mut body = String::new();
+        s.read_to_string(&mut body).await.unwrap();
+        assert!(body.contains("Login canceled"), "{body}");
     }
 
     #[test]

@@ -10,7 +10,10 @@
 //!      macOS; see [`crate::config::config_path`]). Written as `kube` by
 //!      `fractal cluster connect` and cleared by `fractal cluster
 //!      disconnect`
-//!   4. `api` when an API credential is present, else `kube`
+//!   4. `api`: the hosted platform is the default, so a signed-out user is
+//!      told to run `fractal login` rather than being sent to whatever
+//!      cluster their kubeconfig points at. Direct cluster access is
+//!      always an explicit choice
 
 use std::fmt;
 
@@ -60,7 +63,6 @@ pub fn select(
     flag: Option<Transport>,
     env: Option<&str>,
     config: Option<&str>,
-    has_api_credential: bool,
 ) -> Result<Transport> {
     if let Some(t) = flag {
         return Ok(t);
@@ -71,11 +73,7 @@ pub fn select(
     if let Some(raw) = config.filter(|v| !v.trim().is_empty()) {
         return Transport::parse(raw, "config.toml");
     }
-    Ok(if has_api_credential {
-        Transport::Api
-    } else {
-        Transport::Kube
-    })
+    Ok(Transport::Api)
 }
 
 /// Resolve the transport from the flag, the environment, and the
@@ -91,13 +89,7 @@ pub fn resolve(flag: Option<Transport>) -> Result<Transport> {
     }
     let env = std::env::var("FRACTAL_TRANSPORT").ok();
     let cfg = crate::config::Config::load()?;
-    let has_credential = crate::api::credential_from(&cfg).is_some();
-    select(
-        None,
-        env.as_deref(),
-        cfg.transport.as_deref(),
-        has_credential,
-    )
+    select(None, env.as_deref(), cfg.transport.as_deref())
 }
 
 /// Error for a command that has no hosted equivalent yet. `hint` tells
@@ -112,56 +104,48 @@ mod tests {
 
     #[test]
     fn flag_beats_everything() {
-        let t = select(Some(Transport::Kube), Some("api"), Some("api"), true).unwrap();
+        let t = select(Some(Transport::Kube), Some("api"), Some("api")).unwrap();
         assert_eq!(t, Transport::Kube);
-        let t = select(Some(Transport::Api), Some("kube"), Some("kube"), false).unwrap();
+        let t = select(Some(Transport::Api), Some("kube"), Some("kube")).unwrap();
         assert_eq!(t, Transport::Api);
     }
 
     #[test]
-    fn env_beats_config_and_credential() {
+    fn env_beats_config() {
         assert_eq!(
-            select(None, Some("kube"), Some("api"), true).unwrap(),
+            select(None, Some("kube"), Some("api")).unwrap(),
             Transport::Kube
         );
         assert_eq!(
-            select(None, Some("API"), Some("kube"), false).unwrap(),
+            select(None, Some("API"), Some("kube")).unwrap(),
             Transport::Api
         );
     }
 
     #[test]
-    fn config_beats_credential() {
+    fn config_beats_default() {
         // A BYOC user who ran `cluster connect` and later logged in keeps kube
-        assert_eq!(
-            select(None, None, Some("kube"), true).unwrap(),
-            Transport::Kube
-        );
-        assert_eq!(
-            select(None, None, Some("api"), false).unwrap(),
-            Transport::Api
-        );
+        assert_eq!(select(None, None, Some("kube")).unwrap(), Transport::Kube);
+        assert_eq!(select(None, None, Some("api")).unwrap(), Transport::Api);
     }
 
     #[test]
-    fn credential_picks_api_otherwise_kube() {
-        assert_eq!(select(None, None, None, true).unwrap(), Transport::Api);
-        assert_eq!(select(None, None, None, false).unwrap(), Transport::Kube);
+    fn defaults_to_the_hosted_api_even_when_signed_out() {
+        // Signed out must lead to `fractal login`, never to an implicit
+        // kubeconfig cluster
+        assert_eq!(select(None, None, None).unwrap(), Transport::Api);
     }
 
     #[test]
     fn blank_values_fall_through() {
-        assert_eq!(
-            select(None, Some(""), Some("  "), true).unwrap(),
-            Transport::Api
-        );
+        assert_eq!(select(None, Some(""), Some("  ")).unwrap(), Transport::Api);
     }
 
     #[test]
     fn unknown_values_are_rejected_with_origin() {
-        let err = select(None, Some("grpc"), None, true).unwrap_err();
+        let err = select(None, Some("grpc"), None).unwrap_err();
         assert!(err.to_string().contains("FRACTAL_TRANSPORT"));
-        let err = select(None, None, Some("ssh"), true).unwrap_err();
+        let err = select(None, None, Some("ssh")).unwrap_err();
         assert!(err.to_string().contains("config.toml"));
     }
 

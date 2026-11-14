@@ -48,7 +48,8 @@ struct Cli {
     /// transport saved in the config file (`~/.config/fractal/config.toml`
     /// on Linux, `~/Library/Application Support/fractal/config.toml` on
     /// macOS); `fractal cluster disconnect` clears the saved one.
-    /// Defaults to `api` when a token is configured.
+    /// Defaults to `api`; direct cluster access is opt-in through
+    /// `fractal cluster connect`, `FRACTAL_TRANSPORT=kube`, or this flag.
     #[arg(long, global = true, value_enum)]
     transport: Option<Transport>,
     /// Project (name or slug) that owns the service, for the api
@@ -594,6 +595,10 @@ fn main() -> ExitCode {
     };
     match dispatch(cli.command, &ctx) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if api::is_auth_required(&e) => {
+            eprintln!("{e}");
+            ExitCode::from(api::AUTH_REQUIRED_EXIT)
+        }
         Err(e) => {
             eprintln!("Error: {e}");
             ExitCode::FAILURE
@@ -602,8 +607,7 @@ fn main() -> ExitCode {
 }
 
 /// Hint for commands that need direct cluster access
-const NEEDS_CLUSTER: &str =
-    "it needs direct cluster access (connect a BYOC cluster and use `--transport kube`)";
+const NEEDS_CLUSTER: &str = "it needs direct cluster access (run `fractal cluster connect` for a BYOC cluster, or pass `--transport kube`)";
 
 /// Hint for service actions the dashboard covers
 const USE_SERVICE_PAGE: &str = "use the service's page in the dashboard";

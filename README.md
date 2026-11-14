@@ -100,6 +100,8 @@ fractal deploy --service my-service
 
 For CI and other non-interactive use, set `FRACTAL_API_TOKEN` to an API token instead (see [CI and automation](#ci-and-automation)).
 
+Commands never open a browser on their own; only `fractal login` does. When you are not logged in, or your session has expired or your token was revoked, a command prints what to do (for example, `You're not logged in to Fractal. Run fractal login to sign in, ...`) and exits with status `4`, so scripts can tell "sign in first" apart from other failures (status `1`). On the sign-in page, **Deny** cancels the login: the tab says so and the terminal prints `login canceled`.
+
 A service is addressed by name. When two projects have a service with the same name, pick one with `--project <name-or-slug>` (or `FRACTAL_PROJECT`).
 
 ### What works on hosted workspaces
@@ -158,7 +160,7 @@ The CLI picks a transport per command, highest precedence first:
 1. The `--transport api|kube` flag.
 2. The `FRACTAL_TRANSPORT` env var (`api` or `kube`).
 3. `transport` in the config file, in your OS config dir (`~/.config/fractal/config.toml` on Linux, `~/Library/Application Support/fractal/config.toml` on macOS). `fractal cluster connect` writes `transport = "kube"`, so a BYOC machine keeps talking to its own cluster even after an API login; `fractal cluster disconnect` clears it.
-4. Otherwise `api` when a credential is present (`FRACTAL_API_TOKEN`, `FRACTAL_AUTH_TOKEN`, or a saved login) and `kube` when none is.
+4. Otherwise `api`. Direct cluster access is always an explicit choice (`fractal cluster connect`, `FRACTAL_TRANSPORT=kube`, or `--transport kube`), so a signed-out command tells you to run `fractal login` rather than acting on whatever cluster your kubeconfig points at.
 
 `deploy` always goes through the API, and the `cluster` commands always use kubeconfig, whatever the transport. Run `fractal whoami` to see which transport is active.
 
@@ -253,7 +255,7 @@ fractal deploy --project myproject --service my-api
 | `FRACTAL_API_TOKEN` | Fractal API token. Takes precedence over any saved login. | (unset) |
 | `FRACTAL_AUTH_TOKEN` | Older name for the token override, used when `FRACTAL_API_TOKEN` is unset. | (unset) |
 | `FRACTAL_API_URL` | Base URL of the Fractal API. Overrides `api_url` in the config file. | `https://api.fractal.omni.dev` |
-| `FRACTAL_TRANSPORT` | `api` or `kube`. Overrides the config file; the `--transport` flag overrides this. | (auto) |
+| `FRACTAL_TRANSPORT` | `api` or `kube`. Overrides the config file; the `--transport` flag overrides this. | `api` |
 | `FRACTAL_PROJECT` | Default project for service commands on the `api` transport. The `--project` flag overrides it. | (unset) |
 | `FRACTAL_WORKSPACE` | Workspace to act in (slug or id). Overrides the saved workspace; the `--workspace` flag overrides it. See [Workspaces](#workspaces). | (saved workspace) |
 | `FRACTAL_AUTH_URL` | Base URL of the identity provider used by `fractal login`. Endpoints are read from its discovery document. | `https://identity.omni.dev` |
@@ -287,7 +289,7 @@ fractal cluster status
 
 Related cluster commands: `fractal cluster list-tokens` and `fractal cluster revoke-token <id>`.
 
-To point the CLI back at the hosted API on a machine that ran `cluster connect`, run `fractal cluster disconnect`. It clears the saved `transport = "kube"` (keeping your login), so commands default to `api` again when you are logged in. It does not touch the cluster: workloads keep running, and it prints the command that removes the operator (`kubectl -n fractal-system delete deploy fractal-operator`). For a one-off, pass `--transport api` or set `FRACTAL_TRANSPORT=api` instead.
+To point the CLI back at the hosted API on a machine that ran `cluster connect`, run `fractal cluster disconnect`. It clears the saved `transport = "kube"` (keeping your login), so commands use the hosted API again. It does not touch the cluster: workloads keep running, and it prints the command that removes the operator (`kubectl -n fractal-system delete deploy fractal-operator`). For a one-off, pass `--transport api` or set `FRACTAL_TRANSPORT=api` instead.
 
 ## Development
 
