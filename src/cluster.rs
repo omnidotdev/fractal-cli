@@ -7,12 +7,6 @@ use kube::api::ListParams;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Api, Client, Config};
 
-/// Fallback install bundle URL printed when the per-cluster mint
-/// endpoint isn't reachable (e.g. the user hasn't set `FRACTAL_API_URL`
-/// or `FRACTAL_AUTH_TOKEN`). Lets the CLI still produce a runnable
-/// install command for users on the OSS path.
-const DEFAULT_BUNDLE_URL: &str = "https://fractal.omni.dev/install/operator.yaml";
-
 /// Shape of `POST /v1/clusters/install-tokens` request body. Currently
 /// just the optional human-readable cluster label.
 #[derive(serde::Serialize)]
@@ -68,8 +62,8 @@ async fn api_session() -> Result<(String, String, reqwest::Client)> {
 ///
 /// # Errors
 ///
-/// Returns an error if the API URL or auth token env vars are missing,
-/// the HTTP call fails, or the server returns a non-2xx status.
+/// Returns an error if no credential is configured, the HTTP call
+/// fails, or the server returns a non-2xx status.
 async fn mint_install_token(cluster_name: Option<&str>) -> Result<MintTokenResponse> {
     let (base, token, client) = api_session().await?;
     let url = format!("{}/v1/clusters/install-tokens", base.trim_end_matches('/'));
@@ -105,8 +99,8 @@ async fn mint_install_token(cluster_name: Option<&str>) -> Result<MintTokenRespo
 ///
 /// # Errors
 ///
-/// Returns an error if env vars are missing, the HTTP call fails, or
-/// the server returns a non-2xx status.
+/// Returns an error if no credential is configured, the HTTP call
+/// fails, or the server returns a non-2xx status.
 pub async fn list_tokens() -> Result<()> {
     let (base, token, client) = api_session().await?;
     let url = format!("{}/v1/clusters/install-tokens", base.trim_end_matches('/'));
@@ -173,8 +167,8 @@ pub async fn list_tokens() -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error if env vars are missing, the HTTP call fails, or
-/// the server returns a non-2xx status.
+/// Returns an error if no credential is configured, the HTTP call
+/// fails, or the server returns a non-2xx status.
 pub async fn revoke_token(id: &str) -> Result<()> {
     let (base, token, client) = api_session().await?;
     let url = format!(
@@ -274,93 +268,74 @@ fn install_url_with_registry(base: &str, registry: Option<&str>, insecure: bool)
     )
 }
 
-/// Mint an install token and print its URL + instructions. Returns
-/// `true` if mint succeeded (caller should skip the static fallback);
-/// `false` if mint failed (caller should print the static fallback).
-/// Errors are logged inline as warnings - this is a soft-fail because
-/// the OSS bundle is still a usable install path.
-async fn try_mint_and_print(
+/// Mint an install token and print its URL + instructions. The signed,
+/// single-use URL is the only install path: there is no public static
+/// bundle to fall back to.
+async fn mint_and_print(
     cluster_name: Option<&str>,
     registry: Option<&str>,
     registry_insecure: bool,
-) -> bool {
-    match mint_install_token(cluster_name).await {
-        Ok(minted) => {
-            let install_url =
-                install_url_with_registry(&minted.install_url, registry, registry_insecure);
-            println!(
-                "{} {}):",
-                "Install URL (single-use, expires".bold(),
-                minted.expires_at.bold()
-            );
-            println!("  {}", install_url.cyan());
-            println!();
-            if let Some(reg) = registry {
-                let host = reg.split('/').next().unwrap_or(reg);
-                println!(
-                    "{}",
-                    "BYOC registry: create the pull credential first (it never transits Omni):"
-                        .bold()
-                );
-                println!(
-                    "  {}",
-                    format!(
-                        "kubectl -n fractal-system create secret docker-registry \
+) -> Result<()> {
+    let minted = mint_install_token(cluster_name)
+        .await
+        .context("could not mint an install token")?;
+    let install_url = install_url_with_registry(&minted.install_url, registry, registry_insecure);
+    println!(
+        "{} {}):",
+        "Install URL (single-use, expires".bold(),
+        minted.expires_at.bold()
+    );
+    println!("  {}", install_url.cyan());
+    println!();
+    if let Some(reg) = registry {
+        let host = reg.split('/').next().unwrap_or(reg);
+        println!(
+            "{}",
+            "BYOC registry: create the pull credential first (it never transits Omni):".bold()
+        );
+        println!(
+            "  {}",
+            format!(
+                "kubectl -n fractal-system create secret docker-registry \
 fractal-registry-credentials --docker-server={host} --docker-username=<user> \
 --docker-password=<pass>"
-                    )
-                    .dimmed()
-                );
-                println!();
-            }
-            println!("{}", "To install, run:".bold());
-            if registry.is_some() {
-                println!(
-                    "  {}",
-                    format!("curl -sSfL '{install_url}' | kubectl apply -f -").dimmed()
-                );
-            } else {
-                for line in minted.instructions.lines() {
-                    println!("  {}", line.dimmed());
-                }
-            }
-            println!();
-            println!(
-                "{} once the operator pod is Ready, run {} to verify.",
-                "Then:".bold(),
-                "fractal cluster status".cyan()
-            );
-            true
-        }
-        Err(err) => {
-            println!(
-                "{} could not mint install token: {err}",
-                "Warning:".yellow().bold(),
-            );
-            println!(
-                "{} falling back to static OSS bundle URL",
-                "Note:".yellow().bold(),
-            );
-            println!();
-            false
+            )
+            .dimmed()
+        );
+        println!();
+    }
+    println!("{}", "To install, run:".bold());
+    if registry.is_some() {
+        println!(
+            "  {}",
+            format!("curl -sSfL '{install_url}' | kubectl apply -f -").dimmed()
+        );
+    } else {
+        for line in minted.instructions.lines() {
+            println!("  {}", line.dimmed());
         }
     }
+    println!();
+    println!(
+        "{} once the operator pod is Ready, run {} to verify.",
+        "Then:".bold(),
+        "fractal cluster status".cyan()
+    );
+    Ok(())
 }
 
 /// Validate cluster connectivity, then print install instructions.
 ///
-/// When `FRACTAL_API_URL` + `FRACTAL_AUTH_TOKEN` are set, mints a
-/// single-use install token via the API and prints the signed URL +
-/// curl-into-kubectl command. Otherwise falls back to the static OSS
-/// bundle URL.
+/// Mints a single-use install token via the API (which needs a
+/// credential: `fractal login` or `FRACTAL_API_TOKEN`) and prints the
+/// signed URL + curl-into-kubectl command.
 ///
 /// # Errors
 ///
-/// Returns an error if the kubeconfig cannot be loaded or the apiserver
-/// is unreachable. Cluster introspection failures (node list, version)
-/// are surfaced as warnings rather than hard errors so the user still
-/// gets the install URL. Mint failures are also surfaced as warnings;
-/// the fallback bundle URL still works for OSS installs.
+/// Returns an error if the kubeconfig cannot be loaded, no credential is
+/// configured, or the install token can't be minted. Cluster
+/// introspection failures (node list) are surfaced as warnings rather
+/// than hard errors so the user still gets the install URL.
 pub async fn connect(
     kubeconfig: Option<PathBuf>,
     context: Option<String>,
@@ -368,6 +343,10 @@ pub async fn connect(
     registry: Option<String>,
     registry_insecure: bool,
 ) -> Result<()> {
+    // Fail fast: without a credential there is no install URL to print
+    if crate::api::credential().is_none() {
+        anyhow::bail!("{NOT_LOGGED_IN}");
+    }
     let path = resolve_kubeconfig_path(kubeconfig.as_deref())?;
     if !path.exists() {
         anyhow::bail!(
@@ -436,39 +415,19 @@ pub async fn connect(
 
     println!();
 
-    if crate::api::credential().is_some()
-        && try_mint_and_print(
-            cluster_name.as_deref(),
-            registry.as_deref(),
-            registry_insecure,
-        )
-        .await
-    {
-        return Ok(());
-    }
-
-    println!(
-        "{} {}",
-        "Install bundle (static, unsigned):".bold(),
-        DEFAULT_BUNDLE_URL.cyan()
-    );
-
-    println!();
-    println!("{}", "To install, run:".bold());
-    println!(
-        "  {} {}",
-        "kubectl apply -f".dimmed(),
-        DEFAULT_BUNDLE_URL.cyan()
-    );
-    println!();
-    println!(
-        "{} once the operator pod is Ready, run {} to verify.",
-        "Then:".bold(),
-        "fractal cluster status".cyan()
-    );
-
-    Ok(())
+    mint_and_print(
+        cluster_name.as_deref(),
+        registry.as_deref(),
+        registry_insecure,
+    )
+    .await
 }
+
+/// Error for `cluster connect` without a credential. The operator is
+/// installed from a signed, single-use URL minted for your account, so
+/// there is nothing to install until you log in.
+const NOT_LOGGED_IN: &str = "not logged in: the operator install URL is minted for your account. \
+Run `fractal login` (or set FRACTAL_API_TOKEN), then rerun `fractal cluster connect`";
 
 /// Record `transport = "kube"` in the CLI config. Failure is a warning:
 /// connecting the cluster matters more than remembering the preference.
@@ -545,36 +504,109 @@ pub async fn status() -> Result<()> {
     Ok(())
 }
 
-/// Disconnect the local context from the Fractal dashboard.
+/// Point this machine back at the hosted API and explain how to remove
+/// the operator.
 ///
-/// Currently a placeholder — the live cluster registration / heartbeat
-/// service that this command revokes against isn't deployed yet. Once
-/// the install bundle generator + cluster registration endpoint land,
-/// this will revoke the cluster's outbound credentials (Vortex/Aether
-/// mTLS) so the dashboard treats the cluster as disconnected.
+/// Clears the `transport` saved by `cluster connect`, so commands fall
+/// back to the default (`api` when logged in). It does not touch the
+/// cluster: the operator and its workloads keep running until you
+/// delete them, and the printed `kubectl` command does that.
 ///
 /// # Errors
 ///
-/// Returns an error if the apiserver is unreachable.
-#[allow(clippy::unused_async)] // signature locked in for when the SaaS endpoint lands
-pub async fn disconnect() -> Result<()> {
+/// Returns an error if the config file can't be read or written.
+pub fn disconnect() -> Result<()> {
+    let path = crate::config::config_path()?;
+    match clear_saved_transport(&path)? {
+        Some(previous) => println!(
+            "{} cleared the saved {} transport ({}); commands now default to {} when you are logged in",
+            "\u{2713}".green(),
+            previous.cyan(),
+            path.display().to_string().dimmed(),
+            "api".cyan(),
+        ),
+        None => println!(
+            "{} no saved transport to clear; commands already use the default",
+            "\u{2713}".green(),
+        ),
+    }
+    println!();
+    println!("Workloads on this cluster keep running. To remove the operator, run:");
     println!(
-        "{} Cluster registration / revocation endpoint not yet deployed.",
-        "Note:".yellow().bold(),
-    );
-    println!("  Workloads on this cluster will keep running. To stop the operator,");
-    println!(
-        "  delete the Deployment in {}: {}",
-        "fractal-system".bold(),
+        "  {}",
         "kubectl -n fractal-system delete deploy fractal-operator".cyan(),
     );
     Ok(())
 }
 
+/// Remove the saved `transport` from the config at `path`, keeping the
+/// login and API URL. Returns the value it cleared, if any; a missing
+/// config file is left alone.
+fn clear_saved_transport(path: &Path) -> Result<Option<String>> {
+    let mut cfg = crate::config::Config::load_from(path)?;
+    let previous = cfg.transport.take();
+    if previous.is_some() {
+        cfg.save_to(path)?;
+    }
+    Ok(previous)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{install_url_with_registry, resolve_kubeconfig_path_inner};
+    use super::{
+        NOT_LOGGED_IN, clear_saved_transport, install_url_with_registry,
+        resolve_kubeconfig_path_inner,
+    };
+    use crate::config::{AuthConfig, Config};
     use std::path::PathBuf;
+
+    #[test]
+    fn disconnect_clears_saved_kube_transport_and_keeps_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config {
+            transport: Some("kube".to_string()),
+            api_url: Some("https://api.example.test".to_string()),
+            auth: AuthConfig {
+                access_token: Some("at".to_string()),
+                ..AuthConfig::default()
+            },
+        }
+        .save_to(&path)
+        .unwrap();
+
+        assert_eq!(
+            clear_saved_transport(&path).unwrap().as_deref(),
+            Some("kube")
+        );
+        let back = Config::load_from(&path).unwrap();
+        assert!(back.transport.is_none());
+        assert_eq!(back.api_url.as_deref(), Some("https://api.example.test"));
+        assert_eq!(back.auth.access_token.as_deref(), Some("at"));
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("transport")
+        );
+
+        // A second disconnect is a no-op
+        assert!(clear_saved_transport(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn disconnect_without_a_config_file_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.toml");
+        assert!(clear_saved_transport(&path).unwrap().is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn not_logged_in_points_at_login_not_a_static_bundle() {
+        assert!(NOT_LOGGED_IN.contains("fractal login"));
+        assert!(NOT_LOGGED_IN.contains("fractal cluster connect"));
+        assert!(!NOT_LOGGED_IN.contains("http"));
+    }
 
     #[test]
     fn install_url_without_registry_is_unchanged() {

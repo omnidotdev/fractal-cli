@@ -1,6 +1,7 @@
-//! Persistent CLI configuration. Stored at
-//! `$XDG_CONFIG_HOME/fractal/config.toml` (or
-//! `~/.config/fractal/config.toml`). Holds the credential from
+//! Persistent CLI configuration. Stored as `fractal/config.toml` in
+//! the OS config dir: `$XDG_CONFIG_HOME/fractal/config.toml` on Linux
+//! (usually `~/.config/fractal/config.toml`) and
+//! `~/Library/Application Support/fractal/config.toml` on macOS. Holds the credential from
 //! `fractal login` (a browser login's access and refresh tokens, or a
 //! saved API token), the preferred transport (`api` or `kube`), and an
 //! optional API base URL. Kubeconfig stays on disk where kubectl keeps
@@ -72,11 +73,11 @@ impl AuthConfig {
     }
 }
 
-/// Compute the path to the CLI's config file. Honors
-/// `XDG_CONFIG_HOME`; otherwise uses `~/.config`.
+/// Compute the path to the CLI's config file: `fractal/config.toml` in
+/// the OS config dir (`$XDG_CONFIG_HOME` or `~/.config` on Linux,
+/// `~/Library/Application Support` on macOS)
 pub fn config_path() -> Result<PathBuf> {
-    let base = dirs::config_dir()
-        .context("could not determine user config directory (set XDG_CONFIG_HOME)")?;
+    let base = dirs::config_dir().context("could not determine the user config directory")?;
     Ok(base.join("fractal").join("config.toml"))
 }
 

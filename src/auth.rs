@@ -2,7 +2,8 @@
 //!
 //! `fractal login` runs the standard browser login against Gatekeeper
 //! (see [`crate::oauth`]) and saves the access token, refresh token, and
-//! expiry to `~/.config/fractal/config.toml` (0600 on Unix). Every API
+//! expiry to the config file (0600 on Unix): `~/.config/fractal/config.toml`
+//! on Linux, `~/Library/Application Support/fractal/config.toml` on macOS. Every API
 //! command then refreshes the access token silently before it expires.
 //! `fractal login --token ftk_...` saves a Fractal API token instead.
 //!

@@ -5,8 +5,11 @@
 //! Precedence, highest first:
 //!   1. `--transport api|kube`
 //!   2. `FRACTAL_TRANSPORT`
-//!   3. `transport` in `~/.config/fractal/config.toml` (written as
-//!      `kube` by `fractal cluster connect`)
+//!   3. `transport` in the config file (`~/.config/fractal/config.toml`
+//!      on Linux, `~/Library/Application Support/fractal/config.toml` on
+//!      macOS; see [`crate::config::config_path`]). Written as `kube` by
+//!      `fractal cluster connect` and cleared by `fractal cluster
+//!      disconnect`
 //!   4. `api` when an API credential is present, else `kube`
 
 use std::fmt;

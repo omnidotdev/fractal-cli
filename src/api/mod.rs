@@ -36,7 +36,8 @@ pub enum CredentialSource {
     ApiTokenEnv,
     /// `FRACTAL_AUTH_TOKEN`
     AuthTokenEnv,
-    /// `~/.config/fractal/config.toml`
+    /// The saved login in the config file (see
+    /// [`crate::config::config_path`])
     Config,
 }
 

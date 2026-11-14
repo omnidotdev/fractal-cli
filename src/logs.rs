@@ -61,6 +61,8 @@ pub async fn tail_logs(
     previous: bool,
     json: bool,
 ) -> Result<()> {
+    // Reject a bad `--since` before touching the cluster
+    let since_seconds = since.map(parse_since).transpose()?;
     let client = Client::try_default().await?;
     let namespace = client.default_namespace().to_string();
 
@@ -81,8 +83,6 @@ pub async fn tail_logs(
     if pods.items.is_empty() {
         anyhow::bail!("no pods found for service '{service}' (label app={service})");
     }
-
-    let since_seconds = since.and_then(parse_duration_secs);
 
     let mut log_params = LogParams {
         follow,
@@ -392,11 +392,12 @@ pub async fn tail_logs_api(
     service: &str,
     opts: &LogOptions<'_>,
 ) -> Result<()> {
+    // Reject a bad `--since` before any credential or network work
+    let since_seconds = opts.since.map(parse_since).transpose()?;
     let client = api::ApiClient::from_env()?;
     let at = api::resolve::locate_service(&client, project, service).await?;
     let namespace = at.namespace();
 
-    let since_seconds = opts.since.and_then(parse_duration_secs);
     let mut started = Instant::now();
     let first: LogsReply = client
         .get(
@@ -488,21 +489,35 @@ pub async fn tail_logs_api(
     }
 }
 
-/// Parse "5m", "1h", "30s", "2d" into seconds.
-fn parse_duration_secs(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
+/// Accepted `--since` format, quoted in the error for a bad value
+const SINCE_FORMAT: &str = "a whole number followed by a unit: s (seconds), m (minutes), \
+h (hours), or d (days), e.g. 30s, 5m, 1h, 2d";
+
+/// Parse a `--since` value ("30s", "5m", "1h", "2d") into seconds.
+///
+/// # Errors
+///
+/// Returns an error naming the accepted format when the value has no
+/// unit, an unknown unit, a non-positive or non-numeric amount, or
+/// overflows.
+pub fn parse_since(raw: &str) -> Result<i64> {
+    let s = raw.trim();
+    let invalid = || anyhow::anyhow!("invalid --since '{raw}': expected {SINCE_FORMAT}");
+    let unit = s.chars().last().ok_or_else(invalid)?;
+    let amount: i64 = s[..s.len() - unit.len_utf8()]
+        .parse()
+        .map_err(|_| invalid())?;
+    if amount <= 0 {
+        return Err(invalid());
     }
-    let (num_part, unit) = s.split_at(s.len().saturating_sub(1));
-    let n: i64 = num_part.parse().ok()?;
-    match unit {
-        "s" => Some(n),
-        "m" => Some(n * 60),
-        "h" => Some(n * 3600),
-        "d" => Some(n * 86400),
-        _ => None,
-    }
+    let scale = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return Err(invalid()),
+    };
+    amount.checked_mul(scale).ok_or_else(invalid)
 }
 
 #[allow(dead_code)]
@@ -518,32 +533,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_seconds() {
-        assert_eq!(parse_duration_secs("30s"), Some(30));
+    fn parses_every_unit() {
+        assert_eq!(parse_since("30s").unwrap(), 30);
+        assert_eq!(parse_since("5m").unwrap(), 300);
+        assert_eq!(parse_since("2h").unwrap(), 7200);
+        assert_eq!(parse_since("1d").unwrap(), 86_400);
+        assert_eq!(parse_since(" 5m ").unwrap(), 300);
     }
+
     #[test]
-    fn parses_minutes() {
-        assert_eq!(parse_duration_secs("5m"), Some(300));
+    fn rejects_invalid_since_with_the_accepted_format() {
+        for bad in [
+            "60",
+            "10x",
+            "",
+            "m",
+            "-5m",
+            "0s",
+            "5 m",
+            "1.5h",
+            "5µ",
+            "9999999999999999999d",
+        ] {
+            let msg = parse_since(bad).unwrap_err().to_string();
+            assert!(msg.contains(&format!("invalid --since '{bad}'")), "{msg}");
+            assert!(msg.contains("e.g. 30s, 5m, 1h, 2d"), "{msg}");
+        }
     }
-    #[test]
-    fn parses_hours() {
-        assert_eq!(parse_duration_secs("2h"), Some(7200));
+
+    #[tokio::test]
+    async fn api_transport_rejects_bare_number_since() {
+        // Fails on the value before any credential or network work
+        let opts = LogOptions {
+            since: Some("60"),
+            ..LogOptions::default()
+        };
+        let err = tail_logs_api(Some("demo"), "web", &opts).await.unwrap_err();
+        assert!(err.to_string().contains("invalid --since '60'"), "{err}");
     }
-    #[test]
-    fn parses_days() {
-        assert_eq!(parse_duration_secs("1d"), Some(86400));
-    }
-    #[test]
-    fn rejects_invalid_unit() {
-        assert_eq!(parse_duration_secs("10x"), None);
-    }
-    #[test]
-    fn rejects_empty() {
-        assert_eq!(parse_duration_secs(""), None);
-    }
-    #[test]
-    fn rejects_bare_number() {
-        assert_eq!(parse_duration_secs("60"), None);
+
+    #[tokio::test]
+    async fn kube_transport_rejects_bare_number_since() {
+        // Fails on the value before building a kube client
+        let err = tail_logs("web", false, Some("60"), None, None, false, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid --since '60'"), "{err}");
     }
 
     #[test]

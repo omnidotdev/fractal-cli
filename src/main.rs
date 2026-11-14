@@ -31,7 +31,7 @@ use transport::{Transport, unavailable};
 
 /// Fractal - deploy applications to Kubernetes
 #[derive(Parser)]
-#[command(name = "fractal", version, about)]
+#[command(name = "fractal", version = env!("FRACTAL_VERSION"), about)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -43,7 +43,10 @@ struct Cli {
     json: bool,
     /// How to reach Fractal: `api` (hosted, bearer token) or `kube`
     /// (BYOC/admin, kubeconfig). Overrides `FRACTAL_TRANSPORT` and the
-    /// saved config. Defaults to `api` when a token is configured.
+    /// transport saved in the config file (`~/.config/fractal/config.toml`
+    /// on Linux, `~/Library/Application Support/fractal/config.toml` on
+    /// macOS); `fractal cluster disconnect` clears the saved one.
+    /// Defaults to `api` when a token is configured.
     #[arg(long, global = true, value_enum)]
     transport: Option<Transport>,
     /// Project (name or slug) that owns the service, for the api
@@ -119,7 +122,8 @@ enum Commands {
         /// Follow the log stream (tail -f)
         #[arg(short, long)]
         follow: bool,
-        /// Show logs since duration ago (e.g. 5m, 1h, 2d)
+        /// Show logs from this long ago: a whole number plus a unit,
+        /// s, m, h, or d (e.g. 30s, 5m, 1h, 2d)
         #[arg(long)]
         since: Option<String>,
         /// Show only the last N lines per pod
@@ -374,10 +378,9 @@ enum ClusterCommands {
         /// Kubeconfig context to use (defaults to the current context)
         #[arg(long)]
         context: Option<String>,
-        /// Human-readable label for the cluster (e.g. "us-east-prod").
-        /// Used only when `FRACTAL_API_URL` + `FRACTAL_AUTH_TOKEN` are
-        /// set so the CLI can mint a per-cluster install token via the
-        /// API.
+        /// Human-readable label for the cluster (e.g. "us-east-prod"),
+        /// attached to the per-cluster install token minted through the
+        /// API (needs `fractal login` or `FRACTAL_API_TOKEN`)
         #[arg(long = "name")]
         name: Option<String>,
         /// BYOC: registry (host + namespace, e.g. registry.example.com/myorg)
@@ -393,7 +396,13 @@ enum ClusterCommands {
     },
     /// Report whether the fractal-operator is installed and Ready
     Status,
-    /// Revoke this cluster's dashboard registration (placeholder)
+    /// Point this machine back at the hosted API (clears the saved kube transport)
+    ///
+    /// Clears the `transport = "kube"` that `cluster connect` saved in
+    /// the config file (`~/.config/fractal/config.toml` on Linux,
+    /// `~/Library/Application Support/fractal/config.toml` on macOS),
+    /// keeping your login, then prints how to remove the operator from
+    /// the cluster. Workloads already on the cluster keep running.
     Disconnect,
     /// List install tokens you have issued (active, used, expired)
     ListTokens,
@@ -773,7 +782,7 @@ fn dispatch_cluster(action: ClusterCommands, rt: &tokio::runtime::Runtime) -> an
             registry_insecure,
         )),
         ClusterCommands::Status => rt.block_on(cluster::status()),
-        ClusterCommands::Disconnect => rt.block_on(cluster::disconnect()),
+        ClusterCommands::Disconnect => cluster::disconnect(),
         ClusterCommands::ListTokens => rt.block_on(cluster::list_tokens()),
         ClusterCommands::RevokeToken { id } => rt.block_on(cluster::revoke_token(&id)),
     }
@@ -874,6 +883,36 @@ mod tests {
         .unwrap();
         assert_eq!(cli.project.as_deref(), Some("demo"));
         assert_eq!(cli.transport, Some(super::Transport::Api));
+    }
+
+    #[test]
+    fn version_carries_the_build_stamp() {
+        let cmd = Cli::command();
+        let version = cmd.get_version().unwrap();
+        assert!(
+            version.starts_with(concat!(env!("CARGO_PKG_VERSION"), " (")),
+            "{version}"
+        );
+        assert!(version.ends_with(')'), "{version}");
+    }
+
+    #[test]
+    fn cluster_disconnect_parses_and_documents_the_transport_reset() {
+        let cli = Cli::try_parse_from(["fractal", "cluster", "disconnect"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Commands::Cluster {
+                action: super::ClusterCommands::Disconnect
+            }
+        ));
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("cluster")
+            .and_then(|c| c.find_subcommand_mut("disconnect"))
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("transport"), "{help}");
     }
 
     #[test]
