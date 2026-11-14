@@ -19,7 +19,25 @@ Full documentation: [CLI Reference](https://docs.omni.dev/products/fractal/cli-r
 
 ## Installation
 
-### Prebuilt binary (recommended)
+### Homebrew (macOS and Linux)
+
+```sh
+brew install omnidotdev/tap/fractal
+```
+
+Upgrade with `brew upgrade omnidotdev/tap/fractal`.
+
+### Arch Linux (AUR)
+
+```sh
+yay -S omnidotdev-fractal-cli-bin
+```
+
+Any AUR helper works, or build it by hand with `git clone https://aur.archlinux.org/omnidotdev-fractal-cli-bin.git && cd omnidotdev-fractal-cli-bin && makepkg -si`. The package installs `/usr/bin/fractal`, so it conflicts with the unrelated `fractal` Matrix client in the Arch repos.
+
+Both packages are updated automatically on every release. Their version is `<crate version>.<build number>` (for example `0.1.0.42` for the `cli-v42` release).
+
+### Prebuilt binary
 
 Every push to `master` publishes `fractal` binaries for Linux (glibc) and macOS (amd64 + arm64) to this repo's [GitHub Releases](https://github.com/omnidotdev/fractal-cli/releases), tagged `cli-v<build-number>`. Download the one for your platform, mark it executable, and put it on your `PATH`.
 
@@ -45,7 +63,7 @@ To pin a specific build, swap `latest/download` for `download/cli-v<build-number
 
 `fractal --version` reports the build it came from, e.g. `fractal 0.1.0 (build 42, 1a2b3c4)` for the `cli-v42` release. A binary built from source reports `(dev)`.
 
-Homebrew, AUR, and cargo-registry packages are not yet available.
+A cargo-registry package is not available.
 
 ### Build from source
 

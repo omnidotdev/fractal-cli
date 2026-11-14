@@ -108,5 +108,174 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: cli-v${{ github.run_number }}
+          # Pin the tag to the commit that was built, not whatever master is now
+          target_commitish: ${{ github.sha }}
           name: Fractal CLI (build ${{ github.run_number }})
           files: release/*
+
+  # Package versions are `<Cargo.toml version>.<run number>` (e.g. 0.1.0.42),
+  # matching `fractal --version` ("0.1.0 (build 42, <sha>)") and increasing on
+  # every release, so `brew upgrade` and pacman always see a newer version
+  homebrew:
+    name: Update Homebrew tap 🍺
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+      BUILD: ${{ github.run_number }}
+    steps:
+      - name: Skip without tap token
+        if: env.TAP_GITHUB_TOKEN == ''
+        run: echo "::notice::TAP_GITHUB_TOKEN not set, skipping the Homebrew tap update"
+
+      - uses: actions/checkout@v4
+        if: env.TAP_GITHUB_TOKEN != ''
+        with:
+          sparse-checkout: Cargo.toml
+          sparse-checkout-cone-mode: false
+
+      - name: Update formula
+        if: env.TAP_GITHUB_TOKEN != ''
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          VERSION="${CARGO_VERSION}.${BUILD}"
+          BASE="https://github.com/omnidotdev/fractal-cli/releases/download/cli-v${BUILD}"
+
+          # Hash the published assets, i.e. exactly what `brew install` downloads
+          sha() { curl -fsSL --retry 5 --retry-all-errors "${BASE}/$1" | sha256sum | awk '{print $1}'; }
+          MACOS_ARM_SHA256=$(sha fractal-darwin-arm64)
+          MACOS_X86_SHA256=$(sha fractal-darwin-amd64)
+          LINUX_ARM_SHA256=$(sha fractal-linux-arm64)
+          LINUX_X86_SHA256=$(sha fractal-linux-amd64)
+
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/omnidotdev/homebrew-tap.git" tap
+          cd tap
+          mkdir -p Formula
+          cat > Formula/fractal.rb <<FORMULAEOF
+          class Fractal < Formula
+            desc "CLI for Fractal, the Omni deployment platform"
+            homepage "https://fractal.omni.dev"
+            version "${VERSION}"
+            license "Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "${BASE}/fractal-darwin-arm64"
+                sha256 "${MACOS_ARM_SHA256}"
+              end
+              on_intel do
+                url "${BASE}/fractal-darwin-amd64"
+                sha256 "${MACOS_X86_SHA256}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${BASE}/fractal-linux-arm64"
+                sha256 "${LINUX_ARM_SHA256}"
+              end
+              on_intel do
+                url "${BASE}/fractal-linux-amd64"
+                sha256 "${LINUX_X86_SHA256}"
+              end
+            end
+
+            def install
+              # Release assets are raw binaries named per platform
+              bin.install Dir["fractal-*"].first => "fractal"
+            end
+
+            test do
+              assert_match "build #{version.to_s.split(".").last}", shell_output("#{bin}/fractal --version")
+            end
+          end
+          FORMULAEOF
+          ruby -c Formula/fractal.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/fractal.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update fractal to v${VERSION}"
+            git push
+          fi
+
+  aur:
+    name: Publish to AUR 📦
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+      BUILD: ${{ github.run_number }}
+      PKG: omnidotdev-fractal-cli-bin
+    steps:
+      - name: Skip without AUR key
+        if: env.AUR_SSH_PRIVATE_KEY == ''
+        run: echo "::notice::AUR_SSH_PRIVATE_KEY not set, skipping the AUR publish"
+
+      - uses: actions/checkout@v4
+        if: env.AUR_SSH_PRIVATE_KEY != ''
+
+      - name: Update PKGBUILD and .SRCINFO
+        if: env.AUR_SSH_PRIVATE_KEY != ''
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          VERSION="${CARGO_VERSION}.${BUILD}"
+
+          # Hash the published sources, i.e. exactly what makepkg downloads
+          sha() { curl -fsSL --retry 5 --retry-all-errors "$1" | sha256sum | awk '{print $1}'; }
+          BASE="https://github.com/omnidotdev/fractal-cli/releases/download/cli-v${BUILD}"
+          LICENSE_SHA=$(sha "https://raw.githubusercontent.com/omnidotdev/fractal-cli/cli-v${BUILD}/LICENSE.md")
+          X86_SHA=$(sha "${BASE}/fractal-linux-amd64")
+          ARM_SHA=$(sha "${BASE}/fractal-linux-arm64")
+
+          mkdir -p "aur-out"
+          cp "misc/packaging/aur/${PKG}/PKGBUILD" aur-out/PKGBUILD
+          sed -i \
+            -e "s/^pkgver=.*/pkgver=${VERSION}/" \
+            -e "s/^pkgrel=.*/pkgrel=1/" \
+            -e "s/^sha256sums=.*/sha256sums=('${LICENSE_SHA}')/" \
+            -e "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${X86_SHA}')/" \
+            -e "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${ARM_SHA}')/" \
+            aur-out/PKGBUILD
+
+          # Real makepkg (in an Arch container) so .SRCINFO handles per-arch sources
+          docker run --rm -v "$PWD/aur-out:/pkg" archlinux:base-devel bash -c '
+            useradd -m builder
+            cp /pkg/PKGBUILD /home/builder/
+            chown builder /home/builder/PKGBUILD
+            cd /home/builder
+            su builder -c "makepkg --printsrcinfo"
+          ' > aur-out/.SRCINFO
+          grep -q "pkgver = ${VERSION}" aur-out/.SRCINFO
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Push to AUR
+        if: env.AUR_SSH_PRIVATE_KEY != ''
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          cat >> ~/.ssh/config <<SSH
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+          SSH
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+
+          git clone "ssh://aur@aur.archlinux.org/${PKG}.git" aur-repo
+          cp aur-out/PKGBUILD aur-out/.SRCINFO aur-repo/
+          cd aur-repo
+          git config user.name "Omni"
+          git config user.email "team@omni.dev"
+          git add PKGBUILD .SRCINFO
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update to ${VERSION}"
+            git push origin HEAD:master
+          fi
+          rm -f ~/.ssh/aur
