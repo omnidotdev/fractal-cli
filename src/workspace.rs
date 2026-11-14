@@ -320,7 +320,7 @@ pub fn print_pick_hint() {
 /// workspace selection doesn't apply
 async fn browser_login_token() -> Result<(Config, String)> {
     let cfg = Config::load()?;
-    let cred = api::credential_from(&cfg).context(api::NOT_AUTHENTICATED)?;
+    let cred = api::credential_from(&cfg).ok_or(api::AuthRequired(api::NOT_AUTHENTICATED))?;
     if cred.source != CredentialSource::Config {
         anyhow::bail!(
             "{} is set and takes precedence; workspace selection applies only to a browser login (`fractal login`)",

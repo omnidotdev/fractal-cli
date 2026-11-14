@@ -128,12 +128,34 @@ pub fn api_url() -> String {
 }
 
 /// Message shown when no credential is configured
-pub const NOT_AUTHENTICATED: &str = "Not authenticated. Run `fractal login`, or set FRACTAL_API_TOKEN to a \
-     Fractal API token (see https://docs.omni.dev/products/fractal/api-tokens).";
+pub const NOT_AUTHENTICATED: &str = "You're not logged in to Fractal. Run `fractal login` to sign in, \
+     or set FRACTAL_API_TOKEN for CI and scripts (https://docs.omni.dev/products/fractal/api-tokens).";
 
 /// Message shown when the API rejects the credential
 const REJECTED: &str = "The Fractal API rejected your credential (it may be invalid, expired, or \
      revoked). Run `fractal login`, or create a new API token and set FRACTAL_API_TOKEN.";
+
+/// Exit status for a command that needs a login (matches the common CLI
+/// convention, so scripts can tell "sign in first" apart from a failure)
+pub const AUTH_REQUIRED_EXIT: u8 = 4;
+
+/// The command needs a (fresh) login. `main` maps it to
+/// [`AUTH_REQUIRED_EXIT`]
+#[derive(Debug)]
+pub struct AuthRequired(pub &'static str);
+
+impl std::fmt::Display for AuthRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for AuthRequired {}
+
+/// Whether an error chain means the user has to sign in
+pub fn is_auth_required(err: &anyhow::Error) -> bool {
+    err.chain().any(<dyn std::error::Error>::is::<AuthRequired>)
+}
 
 /// The refresh token for a credential that can be refreshed: a browser
 /// login saved in config. An env token always wins and is never
@@ -220,7 +242,7 @@ impl Session {
         .await
         .map_err(|e| match e {
             oauth::TokenError::Unreachable(_) => anyhow::anyhow!(oauth::REFRESH_UNREACHABLE),
-            _ => anyhow::anyhow!(oauth::SESSION_EXPIRED),
+            _ => AuthRequired(oauth::SESSION_EXPIRED).into(),
         })?;
         let set = TokenSet::from_response(resp, oauth::unix_now(), Some(refresh_token.to_string()));
         if let Some(path) = &self.persist_to {
@@ -273,7 +295,7 @@ impl ApiClient {
             .as_deref()
             .and_then(|p| Config::load_from(p).ok())
             .unwrap_or_default();
-        let cred = credential_from(&cfg).context(NOT_AUTHENTICATED)?;
+        let cred = credential_from(&cfg).ok_or(AuthRequired(NOT_AUTHENTICATED))?;
         let browser = sends_workspace_header(&cred, &cfg.auth);
         let memberships = if browser {
             workspace_ids_in(&cred.token)
@@ -453,7 +475,7 @@ impl ApiClient {
         let refresh = bearer
             .refresh
             .clone()
-            .ok_or_else(|| anyhow::anyhow!(oauth::SESSION_EXPIRED))?;
+            .ok_or(AuthRequired(oauth::SESSION_EXPIRED))?;
         let set = session.refresh(&self.http, &refresh).await?;
         bearer.access = set.access_token;
         bearer.refresh = set.refresh_token;
@@ -617,7 +639,7 @@ fn http_error(status: u16, body: &str) -> anyhow::Error {
         return anyhow::anyhow!(WORKSPACE_DENIED_HINT);
     }
     match status {
-        401 => anyhow::anyhow!(REJECTED),
+        401 => AuthRequired(REJECTED).into(),
         403 => anyhow::anyhow!(
             "permission denied{}",
             msg.map_or_else(String::new, |m| format!(": {m}"))
@@ -697,7 +719,7 @@ pub fn parse_graphql<T: DeserializeOwned>(status: u16, body: &str) -> Result<T> 
             .iter()
             .any(|e| e.code() == Some("UNAUTHENTICATED"))
         {
-            anyhow::bail!(REJECTED);
+            return Err(AuthRequired(REJECTED).into());
         }
         if envelope
             .errors
@@ -1308,5 +1330,18 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(gql.contains("fractal workspace use"), "{gql}");
+    }
+
+    #[test]
+    fn auth_required_is_detected_through_context() {
+        use anyhow::Context as _;
+
+        let err: anyhow::Error = super::AuthRequired(super::NOT_AUTHENTICATED).into();
+        assert!(super::is_auth_required(&err));
+        let wrapped = Err::<(), _>(err).context("listing projects").unwrap_err();
+        assert!(super::is_auth_required(&wrapped));
+        assert!(!super::is_auth_required(&anyhow::anyhow!("not found")));
+        assert!(super::is_auth_required(&super::http_error(401, "")));
+        assert!(!super::is_auth_required(&super::http_error(403, "")));
     }
 }
